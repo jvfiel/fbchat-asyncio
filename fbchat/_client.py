@@ -8,6 +8,7 @@ from . import _graphql
 from ._state import State
 import asyncio
 import aiohttp
+import logging
 import time
 import json
 
@@ -41,10 +42,7 @@ class Client(object):
         """
         return self._uid
 
-    def __init__(
-        self,
-        logging_level=logging.INFO,
-    ):
+    def __init__(self, log=None, loop=None):
         """Initialize and log in the client.
 
         Args:
@@ -66,8 +64,13 @@ class Client(object):
         self._pull_channel = 0
         self._markAlive = True
         self._buddylist = dict()
-
-        handler.setLevel(logging_level)
+        self.loop = loop or asyncio.get_event_loop()
+        self._listening = None
+        self._base_log = log or logging.getLogger("fbchat")
+        self._log = self._base_log.getChild("client")
+        self._util_log = self._base_log.getChild("util")
+        self._state_log = self._base_log.getChild("state")
+        self._req_log = self._base_log.getChild("request")
 
     async def start(self, email, password, max_tries=5, session_cookies=None, login=True):
         """
@@ -100,14 +103,15 @@ class Client(object):
     async def _do_refresh(self):
         # TODO: Raise the error instead, and make the user do the refresh manually
         # It may be a bad idea to do this in an exception handler, if you have a better method, please suggest it!
-        log.warning("Refreshing state and resending request")
+        self._log.warning("Refreshing state and resending request")
         self._state = await State.from_session(session=self._state._session)
 
     async def _get(self, url, query=None, error_retries=3):
         payload = self._generatePayload(query)
+        self._req_log.debug(f"GET {url}?{URL().with_query(payload).query_string}")
         r = await self._state._session.get(prefix_url(url), params=payload)
         content = check_request(r)
-        j = to_json(content)
+        j = to_json(content, log=self._util_log)
         try:
             handle_payload_error(j)
         except FBchatPleaseRefresh:
@@ -119,13 +123,14 @@ class Client(object):
 
     async def _post(self, url, query=None, files=None, as_graphql=False, error_retries=3):
         payload = self._generatePayload(query)
+        self._req_log.debug(f"POST {url}?{URL().with_query(payload).query_string}")
         r = await self._state._session.post(prefix_url(url), data=payload, files=files)
         content = check_request(r)
         try:
             if as_graphql:
                 return _graphql.response_to_json(content)
             else:
-                j = to_json(content)
+                j = to_json(content, log=self._util_log)
                 # TODO: Remove this, and move it to _payload_post instead
                 # We can't yet, since errors raised in here need to be caught below
                 handle_payload_error(j)
@@ -211,13 +216,13 @@ class Client(object):
         """
         try:
             # Load cookies into current session
-            state = await State.from_cookies(session_cookies, user_agent=user_agent)
+            state = await State.from_cookies(session_cookies, user_agent=user_agent, loop=self.loop)
         except Exception as e:
-            log.exception("Failed loading session")
+            self._log.exception("Failed loading session")
             return False
         uid = state.get_user_id()
         if uid is None:
-            log.warning("Could not find c_user cookie")
+            self._log.warning("Could not find c_user cookie")
             return False
         self._state = state
         self._uid = uid
@@ -251,6 +256,8 @@ class Client(object):
                     password,
                     on_2fa_callback=self.on2FACode,
                     user_agent=user_agent,
+                    loop=self.loop,
+                    log=self._state_log
                 )
                 uid = state.get_user_id()
                 if uid is None:
@@ -258,7 +265,7 @@ class Client(object):
             except Exception:
                 if i >= max_tries:
                     raise
-                log.exception("Attempt #{} failed, retrying".format(i))
+                self._log.exception("Attempt #{} failed, retrying".format(i))
                 time.sleep(1)
             else:
                 self._state = state
@@ -518,7 +525,7 @@ class Client(object):
                 # We don't handle Facebook "Groups"
                 pass
             else:
-                log.warning(
+                self._log.warning(
                     "Unknown type {} in {}".format(repr(node["__typename"]), node)
                 )
 
@@ -644,7 +651,7 @@ class Client(object):
                     "{} had an unknown thread type: {}".format(_id, k)
                 )
 
-        log.debug(entries)
+        self._log.debug(entries)
         return entries
 
     async def fetchUserInfo(self, *user_ids):
@@ -847,7 +854,7 @@ class Client(object):
             FBchatException: If request failed
         """
         if offset is not None:
-            log.warning(
+            self._log.warning(
                 "Using `offset` in `fetchThreadList` is no longer supported, "
                 "since Facebook migrated to the use of GraphQL in this request. "
                 "Use `before` instead."
@@ -933,7 +940,7 @@ class Client(object):
         data = {"photo_id": str(image_id)}
         j = await self._post("/mercury/attachments/photo/", data)
 
-        url = get_jsmods_require(j, 3)
+        url = get_jsmods_require(j, 3, log=self._util_log)
         if url is None:
             raise FBchatException("Could not fetch image URL from: {}".format(j))
         return url
@@ -1150,7 +1157,7 @@ class Client(object):
         j = await self._post("/messaging/send/", data)
 
         # update JS token if received in response
-        fb_dtsg = get_jsmods_require(j, 2)
+        fb_dtsg = get_jsmods_require(j, 2, log=self._util_log)
         if fb_dtsg is not None:
             self._state.fb_dtsg = fb_dtsg
 
@@ -1161,7 +1168,7 @@ class Client(object):
                 if "message_id" in action
             ]
             if len(message_ids) != 1:
-                log.warning("Got multiple message ids' back: {}".format(message_ids))
+                self._log.warning("Got multiple message ids' back: {}".format(message_ids))
             if get_thread_id:
                 return message_ids[0]
             else:
@@ -3076,7 +3083,7 @@ class Client(object):
         Args:
             email: The email of the client
         """
-        log.info("Logging in {}...".format(email))
+        self._log.info("Logging in {}...".format(email))
 
     async def on2FACode(self):
         """Called when a 2FA code is needed to progress."""
@@ -3088,11 +3095,11 @@ class Client(object):
         Args:
             email: The email of the client
         """
-        log.info("Login of {} successful.".format(email))
+        self._log.info("Login of {} successful.".format(email))
 
     async def onListening(self):
         """Called when the client is listening."""
-        log.info("Listening...")
+        self._log.info("Listening...")
 
     async def onListenError(self, exception=None):
         """Called when an error was encountered while listening.
@@ -3103,7 +3110,7 @@ class Client(object):
         Returns:
             Whether the loop should keep running
         """
-        log.exception("Got exception while listening")
+        self._log.exception("Got exception while listening")
         return True
 
     async def onMessage(
@@ -3131,7 +3138,7 @@ class Client(object):
             metadata: Extra metadata about the message
             msg: A full set of the data received
         """
-        log.info("{} from {} in {}".format(message_object, thread_id, thread_type.name))
+        self._log.info("{} from {} in {}".format(message_object, thread_id, thread_type.name))
 
     async def onColorChange(
         self,
@@ -3156,7 +3163,7 @@ class Client(object):
             metadata: Extra metadata about the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "Color change from {} in {} ({}): {}".format(
                 author_id, thread_id, thread_type.name, new_color
             )
@@ -3185,7 +3192,7 @@ class Client(object):
             metadata: Extra metadata about the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "Emoji change from {} in {} ({}): {}".format(
                 author_id, thread_id, thread_type.name, new_emoji
             )
@@ -3214,7 +3221,7 @@ class Client(object):
             metadata: Extra metadata about the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "Title change from {} in {} ({}): {}".format(
                 author_id, thread_id, thread_type.name, new_title
             )
@@ -3241,7 +3248,7 @@ class Client(object):
             ts: A timestamp of the action
             msg: A full set of the data received
         """
-        log.info("{} changed thread image in {}".format(author_id, thread_id))
+        self._log.info("{} changed thread image in {}".format(author_id, thread_id))
 
     async def onNicknameChange(
         self,
@@ -3268,7 +3275,7 @@ class Client(object):
             metadata: Extra metadata about the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "Nickname change from {} in {} ({}) for {}: {}".format(
                 author_id, thread_id, thread_type.name, changed_for, new_nickname
             )
@@ -3294,7 +3301,7 @@ class Client(object):
             ts: A timestamp of the action
             msg: A full set of the data received
         """
-        log.info("{} added admin: {} in {}".format(author_id, added_id, thread_id))
+        self._log.info("{} added admin: {} in {}".format(author_id, added_id, thread_id))
 
     async def onAdminRemoved(
         self,
@@ -3316,7 +3323,7 @@ class Client(object):
             ts: A timestamp of the action
             msg: A full set of the data received
         """
-        log.info("{} removed admin: {} in {}".format(author_id, removed_id, thread_id))
+        self._log.info("{} removed admin: {} in {}".format(author_id, removed_id, thread_id))
 
     async def onApprovalModeChange(
         self,
@@ -3339,9 +3346,9 @@ class Client(object):
             msg: A full set of the data received
         """
         if approval_mode:
-            log.info("{} activated approval mode in {}".format(author_id, thread_id))
+            self._log.info("{} activated approval mode in {}".format(author_id, thread_id))
         else:
-            log.info("{} disabled approval mode in {}".format(author_id, thread_id))
+            self._log.info("{} disabled approval mode in {}".format(author_id, thread_id))
 
     async def onMessageSeen(
         self,
@@ -3364,7 +3371,7 @@ class Client(object):
             metadata: Extra metadata about the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "Messages seen by {} in {} ({}) at {}s".format(
                 seen_by, thread_id, thread_type.name, seen_ts / 1000
             )
@@ -3391,7 +3398,7 @@ class Client(object):
             metadata: Extra metadata about the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "Messages {} delivered to {} in {} ({}) at {}s".format(
                 msg_ids, delivered_for, thread_id, thread_type.name, ts / 1000
             )
@@ -3410,7 +3417,7 @@ class Client(object):
             metadata: Extra metadata about the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "Marked messages as seen in threads {} at {}s".format(
                 [(x[0], x[1].name) for x in threads], seen_ts / 1000
             )
@@ -3435,7 +3442,7 @@ class Client(object):
             ts: A timestamp of the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "{} unsent the message {} in {} ({}) at {}s".format(
                 author_id, repr(mid), thread_id, thread_type.name, ts / 1000
             )
@@ -3460,7 +3467,7 @@ class Client(object):
             ts: A timestamp of the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "{} added: {} in {}".format(author_id, ", ".join(added_ids), thread_id)
         )
 
@@ -3483,7 +3490,7 @@ class Client(object):
             ts: A timestamp of the action
             msg: A full set of the data received
         """
-        log.info("{} removed: {} in {}".format(author_id, removed_id, thread_id))
+        self._log.info("{} removed: {} in {}".format(author_id, removed_id, thread_id))
 
     async def onFriendRequest(self, from_id=None, msg=None):
         """Called when the client is listening, and somebody sends a friend request.
@@ -3492,7 +3499,7 @@ class Client(object):
             from_id: The ID of the person that sent the request
             msg: A full set of the data received
         """
-        log.info("Friend request from {}".format(from_id))
+        self._log.info("Friend request from {}".format(from_id))
 
     async def onInbox(self, unseen=None, unread=None, recent_unread=None, msg=None):
         """
@@ -3505,7 +3512,7 @@ class Client(object):
             recent_unread: --
             msg: A full set of the data received
         """
-        log.info("Inbox event: {}, {}, {}".format(unseen, unread, recent_unread))
+        self._log.info("Inbox event: {}, {}, {}".format(unseen, unread, recent_unread))
 
     async def onTyping(
         self, author_id=None, status=None, thread_id=None, thread_type=None, msg=None
@@ -3550,7 +3557,7 @@ class Client(object):
             metadata: Extra metadata about the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             '{} played "{}" in {} ({})'.format(
                 author_id, game_name, thread_id, thread_type.name
             )
@@ -3578,7 +3585,7 @@ class Client(object):
             ts: A timestamp of the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "{} reacted to message {} with {} in {} ({})".format(
                 author_id, mid, reaction.name, thread_id, thread_type.name
             )
@@ -3603,7 +3610,7 @@ class Client(object):
             ts: A timestamp of the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "{} removed reaction from {} message in {} ({})".format(
                 author_id, mid, thread_id, thread_type
             )
@@ -3621,7 +3628,7 @@ class Client(object):
             ts: A timestamp of the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "{} blocked {} ({}) thread".format(author_id, thread_id, thread_type.name)
         )
 
@@ -3637,7 +3644,7 @@ class Client(object):
             ts: A timestamp of the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "{} unblocked {} ({}) thread".format(author_id, thread_id, thread_type.name)
         )
 
@@ -3662,7 +3669,7 @@ class Client(object):
             ts: A timestamp of the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "{} sent live location info in {} ({}) with latitude {} and longitude {}".format(
                 author_id, thread_id, thread_type, location.latitude, location.longitude
             )
@@ -3694,7 +3701,7 @@ class Client(object):
             metadata: Extra metadata about the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "{} started call in {} ({})".format(caller_id, thread_id, thread_type.name)
         )
 
@@ -3726,7 +3733,7 @@ class Client(object):
             metadata: Extra metadata about the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "{} ended call in {} ({})".format(caller_id, thread_id, thread_type.name)
         )
 
@@ -3753,7 +3760,7 @@ class Client(object):
             metadata: Extra metadata about the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "{} joined call in {} ({})".format(joined_id, thread_id, thread_type.name)
         )
 
@@ -3780,7 +3787,7 @@ class Client(object):
             metadata: Extra metadata about the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "{} created poll {} in {} ({})".format(
                 author_id, poll, thread_id, thread_type.name
             )
@@ -3811,7 +3818,7 @@ class Client(object):
             metadata: Extra metadata about the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "{} voted in poll {} in {} ({})".format(
                 author_id, poll, thread_id, thread_type.name
             )
@@ -3840,7 +3847,7 @@ class Client(object):
             metadata: Extra metadata about the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "{} created plan {} in {} ({})".format(
                 author_id, plan, thread_id, thread_type.name
             )
@@ -3867,7 +3874,7 @@ class Client(object):
             metadata: Extra metadata about the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "Plan {} has ended in {} ({})".format(plan, thread_id, thread_type.name)
         )
 
@@ -3894,7 +3901,7 @@ class Client(object):
             metadata: Extra metadata about the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "{} edited plan {} in {} ({})".format(
                 author_id, plan, thread_id, thread_type.name
             )
@@ -3923,7 +3930,7 @@ class Client(object):
             metadata: Extra metadata about the action
             msg: A full set of the data received
         """
-        log.info(
+        self._log.info(
             "{} deleted plan {} in {} ({})".format(
                 author_id, plan, thread_id, thread_type.name
             )
@@ -3955,13 +3962,13 @@ class Client(object):
             msg: A full set of the data received
         """
         if take_part:
-            log.info(
+            self._log.info(
                 "{} will take part in {} in {} ({})".format(
                     author_id, plan, thread_id, thread_type.name
                 )
             )
         else:
-            log.info(
+            self._log.info(
                 "{} won't take part in {} in {} ({})".format(
                     author_id, plan, thread_id, thread_type.name
                 )
@@ -3983,7 +3990,7 @@ class Client(object):
             buddylist: A list of dictionaries with friend id and last seen timestamp
             msg: A full set of the data received
         """
-        log.debug("Chat Timestamps received: {}".format(buddylist))
+        self._log.debug("Chat Timestamps received: {}".format(buddylist))
 
     async def onBuddylistOverlay(self, statuses=None, msg=None):
         """Called when the client is listening and client receives information about friend active status.
@@ -3992,7 +3999,7 @@ class Client(object):
             statuses (dict): Dictionary with user IDs as keys and :class:`ActiveStatus` as values
             msg: A full set of the data received
         """
-        log.debug("Buddylist overlay received: {}".format(statuses))
+        self._log.debug("Buddylist overlay received: {}".format(statuses))
 
     async def onUnknownMesssageType(self, msg=None):
         """Called when the client is listening, and some unknown data was received.
@@ -4000,7 +4007,7 @@ class Client(object):
         Args:
             msg: A full set of the data received
         """
-        log.debug("Unknown message received: {}".format(msg))
+        self._log.debug("Unknown message received: {}".format(msg))
 
     async def onMessageError(self, exception=None, msg=None):
         """Called when an error was encountered while parsing received data.
@@ -4009,7 +4016,7 @@ class Client(object):
             exception: The exception that was encountered
             msg: A full set of the data received
         """
-        log.exception("Exception in parsing of {}".format(msg))
+        self._log.exception("Exception in parsing of {}".format(msg))
 
     """
     END EVENTS

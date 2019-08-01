@@ -24,7 +24,7 @@ def is_home(url):
     return "home" in path or "/" == path
 
 
-async def _2fa_helper(session, code, r):
+async def _2fa_helper(session, code, r, log):
     soup = find_input_fields(r.text)
     data = dict()
 
@@ -35,7 +35,7 @@ async def _2fa_helper(session, code, r):
     data["nh"] = soup.find("input", {"name": "nh"})["value"]
     data["submit[Submit Code]"] = "Submit Code"
     data["codes_submitted"] = 0
-    _util.log.info("Submitting 2FA code.")
+    log.info("Submitting 2FA code.")
 
     r = await session.post(url, data=data)
 
@@ -48,7 +48,7 @@ async def _2fa_helper(session, code, r):
 
     data["name_action_selected"] = "save_device"
     data["submit[Continue]"] = "Continue"
-    _util.log.info("Saving browser.")
+    log.info("Saving browser.")
     # At this stage, we have dtsg, nh, name_action_selected, submit[Continue]
     r = await session.post(url, data=data)
 
@@ -56,7 +56,7 @@ async def _2fa_helper(session, code, r):
         return r
 
     del data["name_action_selected"]
-    _util.log.info("Starting Facebook checkup flow.")
+    log.info("Starting Facebook checkup flow.")
     # At this stage, we have dtsg, nh, submit[Continue]
     r = await session.post(url, data=data)
 
@@ -65,7 +65,7 @@ async def _2fa_helper(session, code, r):
 
     del data["submit[Continue]"]
     data["submit[This was me]"] = "This Was Me"
-    _util.log.info("Verifying login attempt.")
+    log.info("Verifying login attempt.")
     # At this stage, we have dtsg, nh, submit[This was me]
     r = await session.post(url, data=data)
 
@@ -75,7 +75,7 @@ async def _2fa_helper(session, code, r):
     del data["submit[This was me]"]
     data["submit[Continue]"] = "Continue"
     data["name_action_selected"] = "save_device"
-    _util.log.info("Saving device again.")
+    log.info("Saving device again.")
     # At this stage, we have dtsg, nh, submit[Continue], name_action_selected
     r = await session.post(url, data=data)
     return r
@@ -107,7 +107,7 @@ class State(object):
         }
 
     @classmethod
-    async def login(cls, email, password, on_2fa_callback, user_agent=None, loop=None):
+    async def login(cls, email, password, on_2fa_callback, user_agent=None, loop=None, log=None):
         session = ClientSession(loop=loop or asyncio.get_event_loop(), headers={
             "User-Agent": user_agent or random.choice(_util.USER_AGENTS),
             "Referer": "https://www.facebook.com"
@@ -130,7 +130,7 @@ class State(object):
         # Usually, 'Checkpoint' will refer to 2FA
         if "checkpoint" in resp.url.path and ('id="approvals_code"' in text.lower()):
             code = await on_2fa_callback()
-            resp = await _2fa_helper(session, code, resp)
+            resp = await _2fa_helper(session, code, resp, log)
 
         # Sometimes Facebook tries to show the user a "Save Device" dialog
         if "save-device" in resp.url.path:

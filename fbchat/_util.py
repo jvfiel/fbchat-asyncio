@@ -9,7 +9,6 @@ from mimetypes import guess_type
 from os.path import basename
 from yarl import URL
 from aiohttp import ClientSession
-import logging
 from ._exception import (
     FBchatException,
     FBchatFacebookError,
@@ -17,13 +16,6 @@ from ._exception import (
     FBchatNotLoggedIn,
     FBchatPleaseRefresh,
 )
-
-# Log settings
-log = logging.getLogger("client")
-log.setLevel(logging.DEBUG)
-# Creates the console handler
-handler = logging.StreamHandler()
-log.addHandler(handler)
 
 #: Default list of user agents
 USER_AGENTS = [
@@ -159,14 +151,14 @@ def check_content(content, as_json=True):
         raise FBchatFacebookError("Error when sending request: Got empty response")
 
 
-def to_json(content):
+def to_json(content, log):
     content = strip_json_cruft(content)
     j = parse_json(content)
     log.debug(j)
     return j
 
 
-def get_jsmods_require(j, index):
+def get_jsmods_require(j, index, log):
     if j.get("jsmods") and j["jsmods"].get("require"):
         try:
             return j["jsmods"]["require"][0][index][0]
