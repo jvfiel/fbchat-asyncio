@@ -1,24 +1,15 @@
 # -*- coding: UTF-8 -*-
 from __future__ import unicode_literals
 
-import requests
-import urllib
-from uuid import uuid1
-from random import choice
-from bs4 import BeautifulSoup as bs
-from mimetypes import guess_type
 from collections import OrderedDict
 from ._util import *
 from .models import *
 from . import _graphql
 from ._state import State
+import asyncio
+import aiohttp
 import time
 import json
-
-try:
-    from urllib.parse import urlparse, parse_qs
-except ImportError:
-    from urlparse import urlparse, parse_qs
 
 
 ACONTEXT = {
@@ -43,19 +34,6 @@ class Client(object):
     """
 
     @property
-    def ssl_verify(self):
-        """Verify SSL certificate.
-
-        Set to False to allow debugging with a proxy.
-        """
-        # TODO: Deprecate this
-        return self._state._session.verify
-
-    @ssl_verify.setter
-    def ssl_verify(self, value):
-        self._state._session.verify = value
-
-    @property
     def uid(self):
         """The ID of the client.
 
@@ -65,11 +43,6 @@ class Client(object):
 
     def __init__(
         self,
-        email,
-        password,
-        user_agent=None,
-        max_tries=5,
-        session_cookies=None,
         logging_level=logging.INFO,
     ):
         """Initialize and log in the client.
@@ -96,13 +69,23 @@ class Client(object):
 
         handler.setLevel(logging_level)
 
-        # If session cookies aren't set, not properly loaded or gives us an invalid session, then do the login
+    async def start(self, email, password, max_tries=5, session_cookies=None, login=True):
+        """
+        :param email: Facebook `email`, `id` or `phone number`
+        :param password: Facebook account password
+        :param max_tries: Maximum number of times to try logging in
+        :param session_cookies: Cookies from a previous session (Will default to login if these are invalid)
+        :type max_tries: int
+        :type session_cookies: dict
+        :raises: FBchatException on failed login
+        """
         if (
             not session_cookies
-            or not self.setSession(session_cookies, user_agent=user_agent)
+            or not self.setSession(session_cookies)
             or not self.isLoggedIn()
         ):
-            self.login(email, password, max_tries, user_agent=user_agent)
+            if login:
+                await self.login(email, password, max_tries)
 
     """
     INTERNAL REQUEST METHODS
@@ -114,29 +97,29 @@ class Client(object):
         query.update(self._state.get_params())
         return query
 
-    def _do_refresh(self):
+    async def _do_refresh(self):
         # TODO: Raise the error instead, and make the user do the refresh manually
         # It may be a bad idea to do this in an exception handler, if you have a better method, please suggest it!
         log.warning("Refreshing state and resending request")
-        self._state = State.from_session(session=self._state._session)
+        self._state = await State.from_session(session=self._state._session)
 
-    def _get(self, url, query=None, error_retries=3):
+    async def _get(self, url, query=None, error_retries=3):
         payload = self._generatePayload(query)
-        r = self._state._session.get(prefix_url(url), params=payload)
+        r = await self._state._session.get(prefix_url(url), params=payload)
         content = check_request(r)
         j = to_json(content)
         try:
             handle_payload_error(j)
         except FBchatPleaseRefresh:
             if error_retries > 0:
-                self._do_refresh()
-                return self._get(url, query=query, error_retries=error_retries - 1)
+                await self._do_refresh()
+                return await self._get(url, query=query, error_retries=error_retries - 1)
             raise
         return j
 
-    def _post(self, url, query=None, files=None, as_graphql=False, error_retries=3):
+    async def _post(self, url, query=None, files=None, as_graphql=False, error_retries=3):
         payload = self._generatePayload(query)
-        r = self._state._session.post(prefix_url(url), data=payload, files=files)
+        r = await self._state._session.post(prefix_url(url), data=payload, files=files)
         content = check_request(r)
         try:
             if as_graphql:
@@ -149,7 +132,7 @@ class Client(object):
                 return j
         except FBchatPleaseRefresh:
             if error_retries > 0:
-                self._do_refresh()
+                await self._do_refresh()
                 return self._post(
                     url,
                     query=query,
@@ -159,14 +142,14 @@ class Client(object):
                 )
             raise
 
-    def _payload_post(self, url, data, files=None):
-        j = self._post(url, data, files=files)
+    async def _payload_post(self, url, data, files=None):
+        j = await self._post(url, data, files=files)
         try:
             return j["payload"]
         except (KeyError, TypeError):
             raise FBchatException("Missing payload: {}".format(j))
 
-    def graphql_requests(self, *queries):
+    async def graphql_requests(self, *queries):
         """Execute GraphQL queries.
 
         Args:
@@ -183,15 +166,15 @@ class Client(object):
             "response_format": "json",
             "queries": _graphql.queries_to_json(*queries),
         }
-        return tuple(self._post("/api/graphqlbatch/", data, as_graphql=True))
+        return tuple(await self._post("/api/graphqlbatch/", data, as_graphql=True))
 
-    def graphql_request(self, query):
+    async def graphql_request(self, query):
         """Shorthand for ``graphql_requests(query)[0]``.
 
         Raises:
             FBchatException: If request failed
         """
-        return self.graphql_requests(query)[0]
+        return (await self.graphql_requests(query))[0]
 
     """
     END INTERNAL REQUEST METHODS
@@ -201,13 +184,13 @@ class Client(object):
     LOGIN METHODS
     """
 
-    def isLoggedIn(self):
+    async def isLoggedIn(self):
         """Send a request to Facebook to check the login status.
 
         Returns:
             bool: True if the client is still logged in
         """
-        return self._state.is_logged_in()
+        return await self._state.is_logged_in()
 
     def getSession(self):
         """Retrieve session cookies.
@@ -217,7 +200,7 @@ class Client(object):
         """
         return self._state.get_cookies()
 
-    def setSession(self, session_cookies, user_agent=None):
+    async def setSession(self, session_cookies, user_agent=None):
         """Load session cookies.
 
         Args:
@@ -228,7 +211,7 @@ class Client(object):
         """
         try:
             # Load cookies into current session
-            state = State.from_cookies(session_cookies, user_agent=user_agent)
+            state = await State.from_cookies(session_cookies, user_agent=user_agent)
         except Exception as e:
             log.exception("Failed loading session")
             return False
@@ -240,7 +223,7 @@ class Client(object):
         self._uid = uid
         return True
 
-    def login(self, email, password, max_tries=5, user_agent=None):
+    async def login(self, email, password, max_tries=5, user_agent=None):
         """Login the user, using ``email`` and ``password``.
 
         If the user is already logged in, this will do a re-login.
@@ -253,7 +236,7 @@ class Client(object):
         Raises:
             FBchatException: On failed login
         """
-        self.onLoggingIn(email=email)
+        await self.onLoggingIn(email=email)
 
         if max_tries < 1:
             raise FBchatUserError("Cannot login: max_tries should be at least one")
@@ -263,7 +246,7 @@ class Client(object):
 
         for i in range(1, max_tries + 1):
             try:
-                state = State.login(
+                state = await State.login(
                     email,
                     password,
                     on_2fa_callback=self.on2FACode,
@@ -280,16 +263,16 @@ class Client(object):
             else:
                 self._state = state
                 self._uid = uid
-                self.onLoggedIn(email=email)
+                await self.onLoggedIn(email=email)
                 break
 
-    def logout(self):
+    async def logout(self):
         """Safely log out the client.
 
         Returns:
             bool: True if the action was successful
         """
-        if self._state.logout():
+        if await self._state.logout():
             self._state = None
             self._uid = None
             return True
@@ -342,11 +325,11 @@ class Client(object):
     FETCH METHODS
     """
 
-    def _forcedFetch(self, thread_id, mid):
+    async def _forcedFetch(self, thread_id, mid):
         params = {"thread_and_message_id": {"thread_id": thread_id, "message_id": mid}}
-        return self.graphql_request(_graphql.from_doc_id("1768656253222505", params))
+        return await self.graphql_request(_graphql.from_doc_id("1768656253222505", params))
 
-    def fetchThreads(self, thread_location, before=None, after=None, limit=None):
+    async def fetchThreads(self, thread_location, before=None, after=None, limit=None):
         """Fetch all threads in ``thread_location``.
 
         Threads will be sorted from newest to oldest.
@@ -372,7 +355,7 @@ class Client(object):
                 break
 
             # fetchThreadList returns at max 20 threads before last_thread_timestamp (included)
-            candidates = self.fetchThreadList(
+            candidates = await self.fetchThreadList(
                 before=last_thread_timestamp, thread_location=thread_location
             )
 
@@ -403,7 +386,7 @@ class Client(object):
 
         return threads
 
-    def fetchAllUsersFromThreads(self, threads):
+    async def fetchAllUsersFromThreads(self, threads):
         """Fetch all users involved in given threads.
 
         Args:
@@ -428,11 +411,11 @@ class Client(object):
                         and user_id not in users_to_fetch
                     ):
                         users_to_fetch.append(user_id)
-        for user_id, user in self.fetchUserInfo(*users_to_fetch).items():
+        for user_id, user in (await self.fetchUserInfo(*users_to_fetch)).items():
             users.append(user)
         return users
 
-    def fetchAllUsers(self):
+    async def fetchAllUsers(self):
         """Fetch all users the client is currently chatting with.
 
         Returns:
@@ -442,7 +425,7 @@ class Client(object):
             FBchatException: If request failed
         """
         data = {"viewer": self._uid}
-        j = self._payload_post("/chat/user_info_all", data)
+        j = await self._payload_post("/chat/user_info_all", data)
 
         users = []
         for data in j.values():
@@ -453,7 +436,7 @@ class Client(object):
                 users.append(User._from_all_fetch(data))
         return users
 
-    def searchForUsers(self, name, limit=10):
+    async def searchForUsers(self, name, limit=10):
         """Find and get users by their name.
 
         Args:
@@ -467,11 +450,11 @@ class Client(object):
             FBchatException: If request failed
         """
         params = {"search": name, "limit": limit}
-        j = self.graphql_request(_graphql.from_query(_graphql.SEARCH_USER, params))
+        j = await self.graphql_request(_graphql.from_query(_graphql.SEARCH_USER, params))
 
         return [User._from_graphql(node) for node in j[name]["users"]["nodes"]]
 
-    def searchForPages(self, name, limit=10):
+    async def searchForPages(self, name, limit=10):
         """Find and get pages by their name.
 
         Args:
@@ -484,11 +467,11 @@ class Client(object):
             FBchatException: If request failed
         """
         params = {"search": name, "limit": limit}
-        j = self.graphql_request(_graphql.from_query(_graphql.SEARCH_PAGE, params))
+        j = await self.graphql_request(_graphql.from_query(_graphql.SEARCH_PAGE, params))
 
         return [Page._from_graphql(node) for node in j[name]["pages"]["nodes"]]
 
-    def searchForGroups(self, name, limit=10):
+    async def searchForGroups(self, name, limit=10):
         """Find and get group threads by their name.
 
         Args:
@@ -502,11 +485,11 @@ class Client(object):
             FBchatException: If request failed
         """
         params = {"search": name, "limit": limit}
-        j = self.graphql_request(_graphql.from_query(_graphql.SEARCH_GROUP, params))
+        j = await self.graphql_request(_graphql.from_query(_graphql.SEARCH_GROUP, params))
 
         return [Group._from_graphql(node) for node in j["viewer"]["groups"]["nodes"]]
 
-    def searchForThreads(self, name, limit=10):
+    async def searchForThreads(self, name, limit=10):
         """Find and get threads by their name.
 
         Args:
@@ -520,7 +503,7 @@ class Client(object):
             FBchatException: If request failed
         """
         params = {"search": name, "limit": limit}
-        j = self.graphql_request(_graphql.from_query(_graphql.SEARCH_THREAD, params))
+        j = await self.graphql_request(_graphql.from_query(_graphql.SEARCH_THREAD, params))
 
         rtn = []
         for node in j[name]["threads"]["nodes"]:
@@ -541,7 +524,7 @@ class Client(object):
 
         return rtn
 
-    def searchForMessageIDs(self, query, offset=0, limit=5, thread_id=None):
+    async def searchForMessageIDs(self, query, offset=0, limit=5, thread_id=None):
         """Find and get message IDs by query.
 
         Args:
@@ -565,14 +548,13 @@ class Client(object):
             "identifier": "thread_fbid",
             "thread_fbid": thread_id,
         }
-        j = self._payload_post("/ajax/mercury/search_snippets.php?dpr=1", data)
+        j = await self._payload_post("/ajax/mercury/search_snippets.php?dpr=1", data)
 
         result = j["search_snippets"][query]
         snippets = result[thread_id]["snippets"] if result.get(thread_id) else []
-        for snippet in snippets:
-            yield snippet["message_id"]
+        return (snippet["message_id"] for snippet in snippets)
 
-    def searchForMessages(self, query, offset=0, limit=5, thread_id=None):
+    async def searchForMessages(self, query, offset=0, limit=5, thread_id=None):
         """Find and get `Message` objects by query.
 
         Warning:
@@ -590,13 +572,13 @@ class Client(object):
         Raises:
             FBchatException: If request failed
         """
-        message_ids = self.searchForMessageIDs(
+        message_ids = await self.searchForMessageIDs(
             query, offset=offset, limit=limit, thread_id=thread_id
         )
         for mid in message_ids:
-            yield self.fetchMessageInfo(mid, thread_id)
+            yield await self.fetchMessageInfo(mid, thread_id)
 
-    def search(self, query, fetch_messages=False, thread_limit=5, message_limit=5):
+    async def search(self, query, fetch_messages=False, thread_limit=5, message_limit=5):
         """Search for messages in all threads.
 
         Args:
@@ -612,7 +594,7 @@ class Client(object):
             FBchatException: If request failed
         """
         data = {"query": query, "snippetLimit": thread_limit}
-        j = self._payload_post("/ajax/mercury/search_snippets.php?dpr=1", data)
+        j = await self._payload_post("/ajax/mercury/search_snippets.php?dpr=1", data)
         result = j["search_snippets"][query]
 
         if not result:
@@ -624,13 +606,13 @@ class Client(object):
             search_method = self.searchForMessageIDs
 
         return {
-            thread_id: search_method(query, limit=message_limit, thread_id=thread_id)
+            thread_id: await search_method(query, limit=message_limit, thread_id=thread_id)
             for thread_id in result
         }
 
-    def _fetchInfo(self, *ids):
+    async def _fetchInfo(self, *ids):
         data = {"ids[{}]".format(i): _id for i, _id in enumerate(ids)}
-        j = self._payload_post("/chat/user_info/", data)
+        j = await self._payload_post("/chat/user_info/", data)
 
         if j.get("profiles") is None:
             raise FBchatException("No users/pages returned: {}".format(j))
@@ -665,7 +647,7 @@ class Client(object):
         log.debug(entries)
         return entries
 
-    def fetchUserInfo(self, *user_ids):
+    async def fetchUserInfo(self, *user_ids):
         """Fetch users' info from IDs, unordered.
 
         Warning:
@@ -680,7 +662,7 @@ class Client(object):
         Raises:
             FBchatException: If request failed
         """
-        threads = self.fetchThreadInfo(*user_ids)
+        threads = await self.fetchThreadInfo(*user_ids)
         users = {}
         for id_, thread in threads.items():
             if thread.type == ThreadType.USER:
@@ -690,7 +672,7 @@ class Client(object):
 
         return users
 
-    def fetchPageInfo(self, *page_ids):
+    async def fetchPageInfo(self, *page_ids):
         """Fetch pages' info from IDs, unordered.
 
         Warning:
@@ -705,7 +687,7 @@ class Client(object):
         Raises:
             FBchatException: If request failed
         """
-        threads = self.fetchThreadInfo(*page_ids)
+        threads = await self.fetchThreadInfo(*page_ids)
         pages = {}
         for id_, thread in threads.items():
             if thread.type == ThreadType.PAGE:
@@ -715,7 +697,7 @@ class Client(object):
 
         return pages
 
-    def fetchGroupInfo(self, *group_ids):
+    async def fetchGroupInfo(self, *group_ids):
         """Fetch groups' info from IDs, unordered.
 
         Args:
@@ -727,7 +709,7 @@ class Client(object):
         Raises:
             FBchatException: If request failed
         """
-        threads = self.fetchThreadInfo(*group_ids)
+        threads = await self.fetchThreadInfo(*group_ids)
         groups = {}
         for id_, thread in threads.items():
             if thread.type == ThreadType.GROUP:
@@ -737,7 +719,7 @@ class Client(object):
 
         return groups
 
-    def fetchThreadInfo(self, *thread_ids):
+    async def fetchThreadInfo(self, *thread_ids):
         """Fetch threads' info from IDs, unordered.
 
         Warning:
@@ -763,7 +745,7 @@ class Client(object):
             }
             queries.append(_graphql.from_doc_id("2147762685294928", params))
 
-        j = self.graphql_requests(*queries)
+        j = await self.graphql_requests(*queries)
 
         for i, entry in enumerate(j):
             if entry.get("message_thread") is None:
@@ -780,7 +762,7 @@ class Client(object):
         ]
         pages_and_users = {}
         if len(pages_and_user_ids) != 0:
-            pages_and_users = self._fetchInfo(*pages_and_user_ids)
+            pages_and_users = await self._fetchInfo(*pages_and_user_ids)
 
         rtn = {}
         for i, entry in enumerate(j):
@@ -804,7 +786,7 @@ class Client(object):
 
         return rtn
 
-    def fetchThreadMessages(self, thread_id=None, limit=20, before=None):
+    async def fetchThreadMessages(self, thread_id=None, limit=20, before=None):
         """Fetch messages in a thread, ordered by most recent.
 
         Args:
@@ -827,7 +809,7 @@ class Client(object):
             "load_read_receipts": True,
             "before": before,
         }
-        j = self.graphql_request(_graphql.from_doc_id("1860982147341344", params))
+        j = await self.graphql_request(_graphql.from_doc_id("1860982147341344", params))
 
         if j.get("message_thread") is None:
             raise FBchatException("Could not fetch thread {}: {}".format(thread_id, j))
@@ -847,7 +829,7 @@ class Client(object):
 
         return messages
 
-    def fetchThreadList(
+    async def fetchThreadList(
         self, offset=None, limit=20, thread_location=ThreadLocation.INBOX, before=None
     ):
         """Fetch the client's thread list.
@@ -886,7 +868,7 @@ class Client(object):
             "includeDeliveryReceipts": True,
             "includeSeqID": False,
         }
-        j = self.graphql_request(_graphql.from_doc_id("1349387578499440", params))
+        j = await self.graphql_request(_graphql.from_doc_id("1349387578499440", params))
 
         rtn = []
         for node in j["viewer"]["message_threads"]["nodes"]:
@@ -901,7 +883,7 @@ class Client(object):
                 )
         return rtn
 
-    def fetchUnread(self):
+    async def fetchUnread(self):
         """Fetch unread threads.
 
         Returns:
@@ -916,12 +898,12 @@ class Client(object):
             "last_action_timestamp": now() - 60 * 1000
             # 'last_action_timestamp': 0
         }
-        j = self._payload_post("/ajax/mercury/unread_threads.php", form)
+        j = await self._payload_post("/ajax/mercury/unread_threads.php", form)
 
         result = j["unread_thread_fbids"][0]
         return result["thread_fbids"] + result["other_user_fbids"]
 
-    def fetchUnseen(self):
+    async def fetchUnseen(self):
         """Fetch unseen / new threads.
 
         Returns:
@@ -930,12 +912,12 @@ class Client(object):
         Raises:
             FBchatException: If request failed
         """
-        j = self._payload_post("/mercury/unseen_thread_ids/", None)
+        j = await self._payload_post("/mercury/unseen_thread_ids/", None)
 
         result = j["unseen_thread_fbids"][0]
         return result["thread_fbids"] + result["other_user_fbids"]
 
-    def fetchImageUrl(self, image_id):
+    async def fetchImageUrl(self, image_id):
         """Fetch URL to download the original image from an image attachment ID.
 
         Args:
@@ -949,14 +931,14 @@ class Client(object):
         """
         image_id = str(image_id)
         data = {"photo_id": str(image_id)}
-        j = self._post("/mercury/attachments/photo/", data)
+        j = await self._post("/mercury/attachments/photo/", data)
 
         url = get_jsmods_require(j, 3)
         if url is None:
             raise FBchatException("Could not fetch image URL from: {}".format(j))
         return url
 
-    def fetchMessageInfo(self, mid, thread_id=None):
+    async def fetchMessageInfo(self, mid, thread_id=None):
         """Fetch `Message` object from the given message id.
 
         Args:
@@ -970,10 +952,10 @@ class Client(object):
             FBchatException: If request failed
         """
         thread_id, thread_type = self._getThread(thread_id, None)
-        message_info = self._forcedFetch(thread_id, mid).get("message")
+        message_info = (await self._forcedFetch(thread_id, mid)).get("message")
         return Message._from_graphql(message_info)
 
-    def fetchPollOptions(self, poll_id):
+    async def fetchPollOptions(self, poll_id):
         """Fetch list of `PollOption` objects from the poll id.
 
         Args:
@@ -986,10 +968,10 @@ class Client(object):
             FBchatException: If request failed
         """
         data = {"question_id": poll_id}
-        j = self._payload_post("/ajax/mercury/get_poll_options", data)
+        j = await self._payload_post("/ajax/mercury/get_poll_options", data)
         return [PollOption._from_graphql(m) for m in j]
 
-    def fetchPlanInfo(self, plan_id):
+    async def fetchPlanInfo(self, plan_id):
         """Fetch `Plan` object from the plan id.
 
         Args:
@@ -1002,34 +984,34 @@ class Client(object):
             FBchatException: If request failed
         """
         data = {"event_reminder_id": plan_id}
-        j = self._payload_post("/ajax/eventreminder", data)
+        j = await self._payload_post("/ajax/eventreminder", data)
         return Plan._from_fetch(j)
 
-    def _getPrivateData(self):
-        j = self.graphql_request(_graphql.from_doc_id("1868889766468115", {}))
+    async def _getPrivateData(self):
+        j = await self.graphql_request(_graphql.from_doc_id("1868889766468115", {}))
         return j["viewer"]
 
-    def getPhoneNumbers(self):
+    async def getPhoneNumbers(self):
         """Fetch list of user's phone numbers.
 
         Returns:
             list: List of phone numbers
         """
-        data = self._getPrivateData()
+        data = await self._getPrivateData()
         return [
             j["phone_number"]["universal_number"] for j in data["user"]["all_phones"]
         ]
 
-    def getEmails(self):
+    async def getEmails(self):
         """Fetch list of user's emails.
 
         Returns:
             list: List of emails
         """
-        data = self._getPrivateData()
+        data = await self._getPrivateData()
         return [j["display_email"] for j in data["all_emails"]]
 
-    def getUserActiveStatus(self, user_id):
+    async def getUserActiveStatus(self, user_id):
         """Fetch friend active status as an `ActiveStatus` object.
 
         Return ``None`` if status isn't known.
@@ -1043,9 +1025,9 @@ class Client(object):
         Returns:
             ActiveStatus: Given user active status
         """
-        return self._buddylist.get(str(user_id))
+        return await self._buddylist.get(str(user_id))
 
-    def fetchThreadImages(self, thread_id=None):
+    async def fetchThreadImages(self, thread_id=None):
         """Fetch images posted in thread.
 
         Args:
@@ -1057,7 +1039,7 @@ class Client(object):
         thread_id, thread_type = self._getThread(thread_id, None)
         data = {"id": thread_id, "first": 48}
         thread_id = str(thread_id)
-        j = self.graphql_request(_graphql.from_query_id("515216185516880", data))
+        j = await self.graphql_request(_graphql.from_query_id("515216185516880", data))
         while True:
             try:
                 i = j[thread_id]["message_shared_media"]["edges"][0]
@@ -1163,9 +1145,9 @@ class Client(object):
 
         return data
 
-    def _doSendRequest(self, data, get_thread_id=False):
+    async def _doSendRequest(self, data, get_thread_id=False):
         """Send the data to `SendURL`, and returns the message ID or None on failure."""
-        j = self._post("/messaging/send/", data)
+        j = await self._post("/messaging/send/", data)
 
         # update JS token if received in response
         fb_dtsg = get_jsmods_require(j, 2)
@@ -1255,7 +1237,7 @@ class Client(object):
             data["specific_to_list[0]"] = "fbid:{}".format(thread_id)
         return self._doSendRequest(data)
 
-    def quickReply(self, quick_reply, payload=None, thread_id=None, thread_type=None):
+    async def quickReply(self, quick_reply, payload=None, thread_id=None, thread_type=None):
         """Reply to chosen quick reply.
 
         Args:
@@ -1272,7 +1254,7 @@ class Client(object):
         """
         quick_reply.is_response = True
         if isinstance(quick_reply, QuickReplyText):
-            return self.send(
+            return await self.send(
                 Message(text=quick_reply.title, quick_replies=[quick_reply])
             )
         elif isinstance(quick_reply, QuickReplyLocation):
@@ -1280,21 +1262,21 @@ class Client(object):
                 raise ValueError(
                     "Payload must be an instance of `fbchat.LocationAttachment`"
                 )
-            return self.sendLocation(
+            return await self.sendLocation(
                 payload, thread_id=thread_id, thread_type=thread_type
             )
         elif isinstance(quick_reply, QuickReplyEmail):
             if not payload:
-                payload = self.getEmails()[0]
+                payload = (await self.getEmails())[0]
             quick_reply.external_payload = quick_reply.payload
             quick_reply.payload = payload
-            return self.send(Message(text=payload, quick_replies=[quick_reply]))
+            return await self.send(Message(text=payload, quick_replies=[quick_reply]))
         elif isinstance(quick_reply, QuickReplyPhoneNumber):
             if not payload:
-                payload = self.getPhoneNumbers()[0]
+                payload = (await self.getPhoneNumbers())[0]
             quick_reply.external_payload = quick_reply.payload
             quick_reply.payload = payload
-            return self.send(Message(text=payload, quick_replies=[quick_reply]))
+            return await self.send(Message(text=payload, quick_replies=[quick_reply]))
 
     def unsend(self, mid):
         """Unsend message by it's ID (removes it for everyone).
@@ -1303,7 +1285,7 @@ class Client(object):
             mid: :ref:`Message ID <intro_message_ids>` of the message to unsend
         """
         data = {"message_id": mid}
-        j = self._payload_post("/messaging/unsend_message/?dpr=1", data)
+        return self._payload_post("/messaging/unsend_message/?dpr=1", data)
 
     def _sendLocation(
         self, location, current=True, message=None, thread_id=None, thread_type=None
@@ -1333,7 +1315,7 @@ class Client(object):
         Raises:
             FBchatException: If request failed
         """
-        self._sendLocation(
+        return self._sendLocation(
             location=location,
             current=True,
             message=message,
@@ -1358,7 +1340,7 @@ class Client(object):
         Raises:
             FBchatException: If request failed
         """
-        self._sendLocation(
+        return self._sendLocation(
             location=location,
             current=False,
             message=message,
@@ -1366,7 +1348,7 @@ class Client(object):
             thread_type=thread_type,
         )
 
-    def _upload(self, files, voice_clip=False):
+    async def _upload(self, files, voice_clip=False):
         """Upload files to Facebook.
 
         `files` should be a list of files that requests can upload, see
@@ -1378,7 +1360,7 @@ class Client(object):
 
         data = {"voice_clip": voice_clip}
 
-        j = self._payload_post(
+        j = await self._payload_post(
             "https://upload.facebook.com/ajax/mercury/upload.php", data, files=file_dict
         )
 
@@ -1414,7 +1396,7 @@ class Client(object):
 
         return self._doSendRequest(data)
 
-    def sendRemoteFiles(
+    async def sendRemoteFiles(
         self, file_urls, message=None, thread_id=None, thread_type=ThreadType.USER
     ):
         """Send files from URLs to a thread.
@@ -1432,12 +1414,12 @@ class Client(object):
             FBchatException: If request failed
         """
         file_urls = require_list(file_urls)
-        files = self._upload(get_files_from_urls(file_urls))
-        return self._sendFiles(
+        files = await self._upload(await get_files_from_urls(file_urls))
+        return await self._sendFiles(
             files=files, message=message, thread_id=thread_id, thread_type=thread_type
         )
 
-    def sendLocalFiles(
+    async def sendLocalFiles(
         self, file_paths, message=None, thread_id=None, thread_type=ThreadType.USER
     ):
         """Send local files to a thread.
@@ -1456,12 +1438,12 @@ class Client(object):
         """
         file_paths = require_list(file_paths)
         with get_files_from_paths(file_paths) as x:
-            files = self._upload(x)
-        return self._sendFiles(
+            files = await self._upload(x)
+        return await self._sendFiles(
             files=files, message=message, thread_id=thread_id, thread_type=thread_type
         )
 
-    def sendRemoteVoiceClips(
+    async def sendRemoteVoiceClips(
         self, clip_urls, message=None, thread_id=None, thread_type=ThreadType.USER
     ):
         """Send voice clips from URLs to a thread.
@@ -1479,12 +1461,12 @@ class Client(object):
             FBchatException: If request failed
         """
         clip_urls = require_list(clip_urls)
-        files = self._upload(get_files_from_urls(clip_urls), voice_clip=True)
-        return self._sendFiles(
+        files = await self._upload(await get_files_from_urls(clip_urls), voice_clip=True)
+        return await self._sendFiles(
             files=files, message=message, thread_id=thread_id, thread_type=thread_type
         )
 
-    def sendLocalVoiceClips(
+    async def sendLocalVoiceClips(
         self, clip_paths, message=None, thread_id=None, thread_type=ThreadType.USER
     ):
         """Send local voice clips to a thread.
@@ -1503,8 +1485,8 @@ class Client(object):
         """
         clip_paths = require_list(clip_paths)
         with get_files_from_paths(clip_paths) as x:
-            files = self._upload(x, voice_clip=True)
-        return self._sendFiles(
+            files = await self._upload(x, voice_clip=True)
+        return await self._sendFiles(
             files=files, message=message, thread_id=thread_id, thread_type=thread_type
         )
 
@@ -1550,7 +1532,7 @@ class Client(object):
             thread_type=thread_type,
         )
 
-    def forwardAttachment(self, attachment_id, thread_id=None):
+    async def forwardAttachment(self, attachment_id, thread_id=None):
         """Forward an attachment.
 
         Args:
@@ -1565,14 +1547,14 @@ class Client(object):
             "attachment_id": attachment_id,
             "recipient_map[{}]".format(generateOfflineThreadingID()): thread_id,
         }
-        j = self._payload_post("/mercury/attachments/forward/", data)
+        j = await self._payload_post("/mercury/attachments/forward/", data)
         if not j.get("success"):
             raise FBchatFacebookError(
                 "Failed forwarding attachment: {}".format(j["error"]),
                 fb_error_message=j["error"],
             )
 
-    def createGroup(self, message, user_ids):
+    async def createGroup(self, message, user_ids):
         """Create a group with the given user ids.
 
         Args:
@@ -1593,7 +1575,7 @@ class Client(object):
         for i, user_id in enumerate(user_ids + [self._uid]):
             data["specific_to_list[{}]".format(i)] = "fbid:{}".format(user_id)
 
-        message_id, thread_id = self._doSendRequest(data, get_thread_id=True)
+        message_id, thread_id = await self._doSendRequest(data, get_thread_id=True)
         if not thread_id:
             raise FBchatException(
                 "Error when creating group: No thread_id could be found"
@@ -1643,7 +1625,7 @@ class Client(object):
         thread_id, thread_type = self._getThread(thread_id, None)
 
         data = {"uid": user_id, "tid": thread_id}
-        j = self._payload_post("/chat/remove_participants/", data)
+        return self._payload_post("/chat/remove_participants/", data)
 
     def _adminStatus(self, admin_ids, admin, thread_id=None):
         thread_id, thread_type = self._getThread(thread_id, None)
@@ -1655,7 +1637,7 @@ class Client(object):
         for i, admin_id in enumerate(admin_ids):
             data["admin_ids[{}]".format(i)] = str(admin_id)
 
-        j = self._payload_post("/messaging/save_admins/?dpr=1", data)
+        return self._payload_post("/messaging/save_admins/?dpr=1", data)
 
     def addGroupAdmins(self, admin_ids, thread_id=None):
         """Set specified users as group admins.
@@ -1667,7 +1649,7 @@ class Client(object):
         Raises:
             FBchatException: If request failed
         """
-        self._adminStatus(admin_ids, True, thread_id)
+        return self._adminStatus(admin_ids, True, thread_id)
 
     def removeGroupAdmins(self, admin_ids, thread_id=None):
         """Remove admin status from specified users.
@@ -1679,7 +1661,7 @@ class Client(object):
         Raises:
             FBchatException: If request failed
         """
-        self._adminStatus(admin_ids, False, thread_id)
+        return self._adminStatus(admin_ids, False, thread_id)
 
     def changeGroupApprovalMode(self, require_admin_approval, thread_id=None):
         """Change group's approval mode.
@@ -1694,7 +1676,7 @@ class Client(object):
         thread_id, thread_type = self._getThread(thread_id, None)
 
         data = {"set_mode": int(require_admin_approval), "thread_fbid": thread_id}
-        j = self._payload_post("/messaging/set_approval_mode/?dpr=1", data)
+        return self._payload_post("/messaging/set_approval_mode/?dpr=1", data)
 
     def _usersApproval(self, user_ids, approve, thread_id=None):
         thread_id, thread_type = self._getThread(thread_id, None)
@@ -1709,7 +1691,7 @@ class Client(object):
             "response": "ACCEPT" if approve else "DENY",
             "surface": "ADMIN_MODEL_APPROVAL_CENTER",
         }
-        j = self.graphql_request(
+        return self.graphql_request(
             _graphql.from_doc_id("1574519202665847", {"data": data})
         )
 
@@ -1723,7 +1705,7 @@ class Client(object):
         Raises:
             FBchatException: If request failed
         """
-        self._usersApproval(user_ids, True, thread_id)
+        return self._usersApproval(user_ids, True, thread_id)
 
     def denyUsersFromGroup(self, user_ids, thread_id=None):
         """Deny users from joining the group.
@@ -1735,9 +1717,9 @@ class Client(object):
         Raises:
             FBchatException: If request failed
         """
-        self._usersApproval(user_ids, False, thread_id)
+        return self._usersApproval(user_ids, False, thread_id)
 
-    def _changeGroupImage(self, image_id, thread_id=None):
+    async def _changeGroupImage(self, image_id, thread_id=None):
         """Change a thread image from an image id.
 
         Args:
@@ -1751,10 +1733,10 @@ class Client(object):
 
         data = {"thread_image_id": image_id, "thread_id": thread_id}
 
-        j = self._payload_post("/messaging/set_thread_image/?dpr=1", data)
+        j = await self._payload_post("/messaging/set_thread_image/?dpr=1", data)
         return image_id
 
-    def changeGroupImageRemote(self, image_url, thread_id=None):
+    async def changeGroupImageRemote(self, image_url, thread_id=None):
         """Change a thread image from a URL.
 
         Args:
@@ -1764,10 +1746,10 @@ class Client(object):
         Raises:
             FBchatException: If request failed
         """
-        (image_id, mimetype), = self._upload(get_files_from_urls([image_url]))
-        return self._changeGroupImage(image_id, thread_id)
+        (image_id, mimetype), = await self._upload(await get_files_from_urls([image_url]))
+        return await self._changeGroupImage(image_id, thread_id)
 
-    def changeGroupImageLocal(self, image_path, thread_id=None):
+    async def changeGroupImageLocal(self, image_path, thread_id=None):
         """Change a thread image from a local path.
 
         Args:
@@ -1778,9 +1760,9 @@ class Client(object):
             FBchatException: If request failed
         """
         with get_files_from_paths([image_path]) as files:
-            (image_id, mimetype), = self._upload(files)
+            (image_id, mimetype), = await self._upload(files)
 
-        return self._changeGroupImage(image_id, thread_id)
+        return await self._changeGroupImage(image_id, thread_id)
 
     def changeThreadTitle(self, title, thread_id=None, thread_type=ThreadType.USER):
         """Change title of a thread.
@@ -1805,7 +1787,7 @@ class Client(object):
             )
 
         data = {"thread_name": title, "thread_id": thread_id}
-        j = self._payload_post("/messaging/set_thread_name/?dpr=1", data)
+        return self._payload_post("/messaging/set_thread_name/?dpr=1", data)
 
     def changeNickname(
         self, nickname, user_id, thread_id=None, thread_type=ThreadType.USER
@@ -1828,7 +1810,7 @@ class Client(object):
             "participant_id": user_id,
             "thread_or_other_fbid": thread_id,
         }
-        j = self._payload_post(
+        return self._payload_post(
             "/messaging/save_thread_nickname/?source=thread_settings&dpr=1", data
         )
 
@@ -1848,7 +1830,7 @@ class Client(object):
             "color_choice": color.value if color != ThreadColor.MESSENGER_BLUE else "",
             "thread_or_other_fbid": thread_id,
         }
-        j = self._payload_post(
+        return self._payload_post(
             "/messaging/save_thread_color/?source=thread_settings&dpr=1", data
         )
 
@@ -1869,11 +1851,11 @@ class Client(object):
         thread_id, thread_type = self._getThread(thread_id, None)
 
         data = {"emoji_choice": emoji, "thread_or_other_fbid": thread_id}
-        j = self._payload_post(
+        return self._payload_post(
             "/messaging/save_thread_emoji/?source=thread_settings&dpr=1", data
         )
 
-    def reactToMessage(self, message_id, reaction):
+    async def reactToMessage(self, message_id, reaction):
         """React to a message, or removes reaction.
 
         Args:
@@ -1891,10 +1873,10 @@ class Client(object):
             "reaction": reaction.value if reaction else None,
         }
         data = {"doc_id": 1491398900900362, "variables": json.dumps({"data": data})}
-        j = self._payload_post("/webgraphql/mutation", data)
+        j = await self._payload_post("/webgraphql/mutation", data)
         handle_graphql_errors(j)
 
-    def createPlan(self, plan, thread_id=None):
+    async def createPlan(self, plan, thread_id=None):
         """Set a plan.
 
         Args:
@@ -1915,7 +1897,7 @@ class Client(object):
             "location_name": plan.location or "",
             "acontext": ACONTEXT,
         }
-        j = self._payload_post("/ajax/eventreminder/create", data)
+        j = await self._payload_post("/ajax/eventreminder/create", data)
         if "error" in j:
             raise FBchatFacebookError(
                 "Failed creating plan: {}".format(j["error"]),
@@ -1941,7 +1923,7 @@ class Client(object):
             "title": new_plan.title,
             "acontext": ACONTEXT,
         }
-        j = self._payload_post("/ajax/eventreminder/submit", data)
+        return self._payload_post("/ajax/eventreminder/submit", data)
 
     def deletePlan(self, plan):
         """Delete a plan.
@@ -1953,7 +1935,7 @@ class Client(object):
             FBchatException: If request failed
         """
         data = {"event_reminder_id": plan.uid, "delete": "true", "acontext": ACONTEXT}
-        j = self._payload_post("/ajax/eventreminder/submit", data)
+        return self._payload_post("/ajax/eventreminder/submit", data)
 
     def changePlanParticipation(self, plan, take_part=True):
         """Change participation in a plan.
@@ -1970,14 +1952,14 @@ class Client(object):
             "guest_state": "GOING" if take_part else "DECLINED",
             "acontext": ACONTEXT,
         }
-        j = self._payload_post("/ajax/eventreminder/rsvp", data)
+        return self._payload_post("/ajax/eventreminder/rsvp", data)
 
     def eventReminder(self, thread_id, time, title, location="", location_id=""):
         """Deprecated. Use :func:`fbchat.Client.createPlan` instead."""
         plan = Plan(time=time, title=title, location=location, location_id=location_id)
-        self.createPlan(plan=plan, thread_id=thread_id)
+        return self.createPlan(plan=plan, thread_id=thread_id)
 
-    def createPoll(self, poll, thread_id=None):
+    async def createPoll(self, poll, thread_id=None):
         """Create poll in a group thread.
 
         Args:
@@ -1999,14 +1981,14 @@ class Client(object):
             data["option_text_array[{}]".format(i)] = option.text
             data["option_is_selected_array[{}]".format(i)] = str(int(option.vote))
 
-        j = self._payload_post("/messaging/group_polling/create_poll/?dpr=1", data)
+        j = await self._payload_post("/messaging/group_polling/create_poll/?dpr=1", data)
         if j.get("status") != "success":
             raise FBchatFacebookError(
                 "Failed creating poll: {}".format(j.get("errorTitle")),
                 fb_error_message=j.get("errorMessage"),
             )
 
-    def updatePollVote(self, poll_id, option_ids=[], new_options=[]):
+    async def updatePollVote(self, poll_id, option_ids=[], new_options=[]):
         """Update a poll vote.
 
         Args:
@@ -2027,7 +2009,7 @@ class Client(object):
         for i, option_text in enumerate(new_options):
             data["new_options[{}]".format(i)] = option_text
 
-        j = self._payload_post("/messaging/group_polling/update_vote/?dpr=1", data)
+        j = await self._payload_post("/messaging/group_polling/update_vote/?dpr=1", data)
         if j.get("status") != "success":
             raise FBchatFacebookError(
                 "Failed updating poll vote: {}".format(j.get("errorTitle")),
@@ -2053,7 +2035,7 @@ class Client(object):
             "to": thread_id if thread_type == ThreadType.USER else "",
             "source": "mercury-chat",
         }
-        j = self._payload_post("/ajax/messaging/typ.php", data)
+        return self._payload_post("/ajax/messaging/typ.php", data)
 
     """
     END SEND METHODS
@@ -2066,9 +2048,6 @@ class Client(object):
             thread_id: User/Group ID to which the message belongs. See :ref:`intro_threads`
             message_id: Message ID to set as delivered. See :ref:`intro_threads`
 
-        Returns:
-            True
-
         Raises:
             FBchatException: If request failed
         """
@@ -2077,8 +2056,7 @@ class Client(object):
             "thread_ids[%s][0]" % thread_id: message_id,
         }
 
-        j = self._payload_post("/ajax/mercury/delivery_receipts.php", data)
-        return True
+        return self._payload_post("/ajax/mercury/delivery_receipts.php", data)
 
     def _readStatus(self, read, thread_ids):
         thread_ids = require_list(thread_ids)
@@ -2088,7 +2066,7 @@ class Client(object):
         for thread_id in thread_ids:
             data["ids[{}]".format(thread_id)] = "true" if read else "false"
 
-        j = self._payload_post("/ajax/mercury/change_read_status.php", data)
+        return self._payload_post("/ajax/mercury/change_read_status.php", data)
 
     def markAsRead(self, thread_ids=None):
         """Mark threads as read.
@@ -2101,7 +2079,7 @@ class Client(object):
         Raises:
             FBchatException: If request failed
         """
-        self._readStatus(True, thread_ids)
+        return self._readStatus(True, thread_ids)
 
     def markAsUnread(self, thread_ids=None):
         """Mark threads as unread.
@@ -2114,7 +2092,7 @@ class Client(object):
         Raises:
             FBchatException: If request failed
         """
-        self._readStatus(False, thread_ids)
+        return self._readStatus(False, thread_ids)
 
     def markAsSeen(self):
         """
@@ -2130,7 +2108,7 @@ class Client(object):
         """
         data = {"to_friend": friend_id, "action": "confirm"}
 
-        j = self._payload_post("/ajax/add_friend/action.php?dpr=1", data)
+        return self._payload_post("/ajax/add_friend/action.php?dpr=1", data)
 
     def removeFriend(self, friend_id=None):
         """Remove a specified friend from the client's friend list.
@@ -2138,15 +2116,11 @@ class Client(object):
         Args:
             friend_id: The ID of the friend that you want to remove
 
-        Returns:
-            True
-
         Raises:
             FBchatException: If request failed
         """
         data = {"uid": friend_id}
-        j = self._payload_post("/ajax/profile/removefriendconfirm.php", data)
-        return True
+        return self._payload_post("/ajax/profile/removefriendconfirm.php", data)
 
     def blockUser(self, user_id):
         """Block messages from a specified user.
@@ -2154,15 +2128,11 @@ class Client(object):
         Args:
             user_id: The ID of the user that you want to block
 
-        Returns:
-            True
-
         Raises:
             FBchatException: If request failed
         """
         data = {"fbid": user_id}
-        j = self._payload_post("/messaging/block_messages/?dpr=1", data)
-        return True
+        return self._payload_post("/messaging/block_messages/?dpr=1", data)
 
     def unblockUser(self, user_id):
         """Unblock a previously blocked user.
@@ -2170,25 +2140,18 @@ class Client(object):
         Args:
             user_id: The ID of the user that you want to unblock
 
-        Returns:
-            Whether the request was successful
-
         Raises:
             FBchatException: If request failed
         """
         data = {"fbid": user_id}
-        j = self._payload_post("/messaging/unblock_messages/?dpr=1", data)
-        return True
+        return self._payload_post("/messaging/unblock_messages/?dpr=1", data)
 
-    def moveThreads(self, location, thread_ids):
+    async def moveThreads(self, location, thread_ids):
         """Move threads to specified location.
 
         Args:
             location (ThreadLocation): INBOX, PENDING, ARCHIVED or OTHER
             thread_ids: Thread IDs to move. See :ref:`intro_threads`
-
-        Returns:
-            True
 
         Raises:
             FBchatException: If request failed
@@ -2204,20 +2167,20 @@ class Client(object):
             for thread_id in thread_ids:
                 data_archive["ids[{}]".format(thread_id)] = "true"
                 data_unpin["ids[{}]".format(thread_id)] = "false"
-            j_archive = self._payload_post(
+            j_archive = await self._payload_post(
                 "/ajax/mercury/change_archived_status.php?dpr=1", data_archive
             )
-            j_unpin = self._payload_post(
+            j_unpin = await self._payload_post(
                 "/ajax/mercury/change_pinned_status.php?dpr=1", data_unpin
             )
         else:
             data = dict()
             for i, thread_id in enumerate(thread_ids):
                 data["{}[{}]".format(location.name.lower(), i)] = thread_id
-            j = self._payload_post("/ajax/mercury/move_thread.php", data)
+            j = await self._payload_post("/ajax/mercury/move_thread.php", data)
         return True
 
-    def deleteThreads(self, thread_ids):
+    async def deleteThreads(self, thread_ids):
         """Delete threads.
 
         Args:
@@ -2236,10 +2199,10 @@ class Client(object):
         for i, thread_id in enumerate(thread_ids):
             data_unpin["ids[{}]".format(thread_id)] = "false"
             data_delete["ids[{}]".format(i)] = thread_id
-        j_unpin = self._payload_post(
+        j_unpin = await self._payload_post(
             "/ajax/mercury/change_pinned_status.php?dpr=1", data_unpin
         )
-        j_delete = self._payload_post(
+        j_delete = await self._payload_post(
             "/ajax/mercury/delete_thread.php?dpr=1", data_delete
         )
         return True
@@ -2250,24 +2213,17 @@ class Client(object):
         Args:
             thread_id: User/Group ID to mark as spam. See :ref:`intro_threads`
 
-        Returns:
-            True
-
         Raises:
             FBchatException: If request failed
         """
         thread_id, thread_type = self._getThread(thread_id, None)
-        j = self._payload_post("/ajax/mercury/mark_spam.php?dpr=1", {"id": thread_id})
-        return True
+        return self._payload_post("/ajax/mercury/mark_spam.php?dpr=1", {"id": thread_id})
 
     def deleteMessages(self, message_ids):
         """Delete specified messages.
 
         Args:
             message_ids: Message IDs to delete
-
-        Returns:
-            True
 
         Raises:
             FBchatException: If request failed
@@ -2276,8 +2232,7 @@ class Client(object):
         data = dict()
         for i, message_id in enumerate(message_ids):
             data["message_ids[{}]".format(i)] = message_id
-        j = self._payload_post("/ajax/mercury/delete_messages.php?dpr=1", data)
-        return True
+        return self._payload_post("/ajax/mercury/delete_messages.php?dpr=1", data)
 
     def muteThread(self, mute_time=-1, thread_id=None):
         """Mute thread.
@@ -2288,7 +2243,7 @@ class Client(object):
         """
         thread_id, thread_type = self._getThread(thread_id, None)
         data = {"mute_settings": str(mute_time), "thread_fbid": thread_id}
-        j = self._payload_post("/ajax/mercury/change_mute_thread.php?dpr=1", data)
+        return self._payload_post("/ajax/mercury/change_mute_thread.php?dpr=1", data)
 
     def unmuteThread(self, thread_id=None):
         """Unmute thread.
@@ -2307,7 +2262,7 @@ class Client(object):
         """
         thread_id, thread_type = self._getThread(thread_id, None)
         data = {"reactions_mute_mode": int(mute), "thread_fbid": thread_id}
-        j = self._payload_post(
+        return self._payload_post(
             "/ajax/mercury/change_reactions_mute_thread/?dpr=1", data
         )
 
@@ -2328,7 +2283,7 @@ class Client(object):
         """
         thread_id, thread_type = self._getThread(thread_id, None)
         data = {"mentions_mute_mode": int(mute), "thread_fbid": thread_id}
-        j = self._payload_post("/ajax/mercury/change_mentions_mute_thread/?dpr=1", data)
+        return self._payload_post("/ajax/mercury/change_mentions_mute_thread/?dpr=1", data)
 
     def unmuteThreadMentions(self, thread_id=None):
         """Unmute thread mentions.
@@ -2355,7 +2310,7 @@ class Client(object):
             "viewer_uid": self._uid,
             "state": "active",
         }
-        j = self._get(
+        return self._get(
             "https://{}-edge-chat.facebook.com/active_ping".format(self._pull_channel),
             data,
         )
@@ -2374,7 +2329,7 @@ class Client(object):
             "https://{}-edge-chat.facebook.com/pull".format(self._pull_channel), data
         )
 
-    def _parseDelta(self, m):
+    async def _parseDelta(self, m):
         def getThreadIdAndThreadType(msg_metadata):
             """Return a tuple consisting of thread ID and thread type."""
             id_thread = None
@@ -2401,7 +2356,7 @@ class Client(object):
         if "addedParticipants" in delta:
             added_ids = [str(x["userFbId"]) for x in delta["addedParticipants"]]
             thread_id = str(metadata["threadKey"]["threadFbId"])
-            self.onPeopleAdded(
+            await self.onPeopleAdded(
                 mid=mid,
                 added_ids=added_ids,
                 author_id=author_id,
@@ -2414,7 +2369,7 @@ class Client(object):
         elif "leftParticipantFbId" in delta:
             removed_id = str(delta["leftParticipantFbId"])
             thread_id = str(metadata["threadKey"]["threadFbId"])
-            self.onPersonRemoved(
+            await self.onPersonRemoved(
                 mid=mid,
                 removed_id=removed_id,
                 author_id=author_id,
@@ -2427,7 +2382,7 @@ class Client(object):
         elif delta_type == "change_thread_theme":
             new_color = ThreadColor._from_graphql(delta["untypedData"]["theme_color"])
             thread_id, thread_type = getThreadIdAndThreadType(metadata)
-            self.onColorChange(
+            await self.onColorChange(
                 mid=mid,
                 author_id=author_id,
                 new_color=new_color,
@@ -2442,7 +2397,7 @@ class Client(object):
         elif delta_type == "change_thread_icon":
             new_emoji = delta["untypedData"]["thread_icon"]
             thread_id, thread_type = getThreadIdAndThreadType(metadata)
-            self.onEmojiChange(
+            await self.onEmojiChange(
                 mid=mid,
                 author_id=author_id,
                 new_emoji=new_emoji,
@@ -2457,7 +2412,7 @@ class Client(object):
         elif delta_class == "ThreadName":
             new_title = delta["name"]
             thread_id, thread_type = getThreadIdAndThreadType(metadata)
-            self.onTitleChange(
+            await self.onTitleChange(
                 mid=mid,
                 author_id=author_id,
                 new_title=new_title,
@@ -2472,10 +2427,10 @@ class Client(object):
         elif delta_class == "ForcedFetch":
             mid = delta.get("messageId")
             if mid is None:
-                self.onUnknownMesssageType(msg=m)
+                await self.onUnknownMesssageType(msg=m)
             else:
                 thread_id = str(delta["threadKey"]["threadFbId"])
-                fetch_info = self._forcedFetch(thread_id, mid)
+                fetch_info = await self._forcedFetch(thread_id, mid)
                 fetch_data = fetch_info["message"]
                 author_id = fetch_data["message_sender"]["id"]
                 ts = fetch_data["timestamp_precise"]
@@ -2487,7 +2442,7 @@ class Client(object):
                         if image_metadata
                         else None
                     )
-                    self.onImageChange(
+                    await self.onImageChange(
                         mid=mid,
                         author_id=author_id,
                         new_image=image_id,
@@ -2502,7 +2457,7 @@ class Client(object):
             changed_for = str(delta["untypedData"]["participant_id"])
             new_nickname = delta["untypedData"]["nickname"]
             thread_id, thread_type = getThreadIdAndThreadType(metadata)
-            self.onNicknameChange(
+            await self.onNicknameChange(
                 mid=mid,
                 author_id=author_id,
                 changed_for=changed_for,
@@ -2520,7 +2475,7 @@ class Client(object):
             target_id = delta["untypedData"]["TARGET_ID"]
             admin_event = delta["untypedData"]["ADMIN_EVENT"]
             if admin_event == "add_admin":
-                self.onAdminAdded(
+                await self.onAdminAdded(
                     mid=mid,
                     added_id=target_id,
                     author_id=author_id,
@@ -2530,7 +2485,7 @@ class Client(object):
                     msg=m,
                 )
             elif admin_event == "remove_admin":
-                self.onAdminRemoved(
+                await self.onAdminRemoved(
                     mid=mid,
                     removed_id=target_id,
                     author_id=author_id,
@@ -2544,7 +2499,7 @@ class Client(object):
         elif delta_type == "change_thread_approval_mode":
             thread_id, thread_type = getThreadIdAndThreadType(metadata)
             approval_mode = bool(int(delta["untypedData"]["APPROVAL_MODE"]))
-            self.onApprovalModeChange(
+            await self.onApprovalModeChange(
                 mid=mid,
                 approval_mode=approval_mode,
                 author_id=author_id,
@@ -2562,7 +2517,7 @@ class Client(object):
             )
             ts = int(delta["deliveredWatermarkTimestampMs"])
             thread_id, thread_type = getThreadIdAndThreadType(delta)
-            self.onMessageDelivered(
+            await self.onMessageDelivered(
                 msg_ids=message_ids,
                 delivered_for=delivered_for,
                 thread_id=thread_id,
@@ -2578,7 +2533,7 @@ class Client(object):
             seen_ts = int(delta["actionTimestampMs"])
             delivered_ts = int(delta["watermarkTimestampMs"])
             thread_id, thread_type = getThreadIdAndThreadType(delta)
-            self.onMessageSeen(
+            await self.onMessageSeen(
                 seen_by=seen_by,
                 thread_id=thread_id,
                 thread_type=thread_type,
@@ -2605,7 +2560,7 @@ class Client(object):
                 ]
 
             # thread_id, thread_type = getThreadIdAndThreadType(delta)
-            self.onMarkedSeen(
+            await self.onMarkedSeen(
                 threads=threads, seen_ts=seen_ts, ts=delivered_ts, metadata=delta, msg=m
             )
 
@@ -2620,7 +2575,7 @@ class Client(object):
             if leaderboard is not None:
                 leaderboard = json.loads(leaderboard)["scores"]
             thread_id, thread_type = getThreadIdAndThreadType(metadata)
-            self.onGamePlayed(
+            await self.onGamePlayed(
                 mid=mid,
                 author_id=author_id,
                 game_id=game_id,
@@ -2641,7 +2596,7 @@ class Client(object):
             call_duration = int(delta["untypedData"]["call_duration"])
             is_video_call = bool(int(delta["untypedData"]["is_video_call"]))
             if call_status == "call_started":
-                self.onCallStarted(
+                await self.onCallStarted(
                     mid=mid,
                     caller_id=author_id,
                     is_video_call=is_video_call,
@@ -2652,7 +2607,7 @@ class Client(object):
                     msg=m,
                 )
             elif call_status == "call_ended":
-                self.onCallEnded(
+                await self.onCallEnded(
                     mid=mid,
                     caller_id=author_id,
                     is_video_call=is_video_call,
@@ -2668,7 +2623,7 @@ class Client(object):
         elif delta_type == "participant_joined_group_call":
             thread_id, thread_type = getThreadIdAndThreadType(metadata)
             is_video_call = bool(int(delta["untypedData"]["group_call_type"]))
-            self.onUserJoinedCall(
+            await self.onUserJoinedCall(
                 mid=mid,
                 joined_id=author_id,
                 is_video_call=is_video_call,
@@ -2687,7 +2642,7 @@ class Client(object):
             poll = Poll._from_graphql(poll_json)
             if event_type == "question_creation":
                 # User created group poll
-                self.onPollCreated(
+                await self.onPollCreated(
                     mid=mid,
                     poll=poll,
                     author_id=author_id,
@@ -2701,7 +2656,7 @@ class Client(object):
                 # User voted on group poll
                 added_options = json.loads(delta["untypedData"]["added_option_ids"])
                 removed_options = json.loads(delta["untypedData"]["removed_option_ids"])
-                self.onPollVoted(
+                await self.onPollVoted(
                     mid=mid,
                     poll=poll,
                     added_options=added_options,
@@ -2717,7 +2672,7 @@ class Client(object):
         # Plan created
         elif delta_type == "lightweight_event_create":
             thread_id, thread_type = getThreadIdAndThreadType(metadata)
-            self.onPlanCreated(
+            await self.onPlanCreated(
                 mid=mid,
                 plan=Plan._from_pull(delta["untypedData"]),
                 author_id=author_id,
@@ -2731,7 +2686,7 @@ class Client(object):
         # Plan ended
         elif delta_type == "lightweight_event_notify":
             thread_id, thread_type = getThreadIdAndThreadType(metadata)
-            self.onPlanEnded(
+            await self.onPlanEnded(
                 mid=mid,
                 plan=Plan._from_pull(delta["untypedData"]),
                 thread_id=thread_id,
@@ -2744,7 +2699,7 @@ class Client(object):
         # Plan edited
         elif delta_type == "lightweight_event_update":
             thread_id, thread_type = getThreadIdAndThreadType(metadata)
-            self.onPlanEdited(
+            await self.onPlanEdited(
                 mid=mid,
                 plan=Plan._from_pull(delta["untypedData"]),
                 author_id=author_id,
@@ -2758,7 +2713,7 @@ class Client(object):
         # Plan deleted
         elif delta_type == "lightweight_event_delete":
             thread_id, thread_type = getThreadIdAndThreadType(metadata)
-            self.onPlanDeleted(
+            await self.onPlanDeleted(
                 mid=mid,
                 plan=Plan._from_pull(delta["untypedData"]),
                 author_id=author_id,
@@ -2802,7 +2757,7 @@ class Client(object):
                     )
                     add_reaction = not bool(i["action"])
                     if add_reaction:
-                        self.onReactionAdded(
+                        await self.onReactionAdded(
                             mid=mid,
                             reaction=reaction,
                             author_id=author_id,
@@ -2812,7 +2767,7 @@ class Client(object):
                             msg=m,
                         )
                     else:
-                        self.onReactionRemoved(
+                        await self.onReactionRemoved(
                             mid=mid,
                             author_id=author_id,
                             thread_id=thread_id,
@@ -2830,7 +2785,7 @@ class Client(object):
                     can_reply = i["canViewerReply"]
                     if reason == 2:
                         if can_reply:
-                            self.onUnblock(
+                            await self.onUnblock(
                                 author_id=author_id,
                                 thread_id=thread_id,
                                 thread_type=thread_type,
@@ -2838,7 +2793,7 @@ class Client(object):
                                 msg=m,
                             )
                         else:
-                            self.onBlock(
+                            await self.onBlock(
                                 author_id=author_id,
                                 thread_id=thread_id,
                                 thread_type=thread_type,
@@ -2854,7 +2809,7 @@ class Client(object):
                         mid = l["messageId"]
                         author_id = str(l["senderId"])
                         location = LiveLocationAttachment._from_pull(l)
-                        self.onLiveLocation(
+                        await self.onLiveLocation(
                             mid=mid,
                             location=location,
                             author_id=author_id,
@@ -2871,7 +2826,7 @@ class Client(object):
                     mid = i["messageID"]
                     ts = i["deletionTimestamp"]
                     author_id = str(i["senderID"])
-                    self.onMessageUnsent(
+                    await self.onMessageUnsent(
                         mid=mid,
                         author_id=author_id,
                         thread_id=thread_id,
@@ -2887,7 +2842,7 @@ class Client(object):
                     message = Message._from_reply(i["message"])
                     message.replied_to = Message._from_reply(i["repliedToMessage"])
                     message.reply_to_id = message.replied_to.uid
-                    self.onMessage(
+                    await self.onMessage(
                         mid=message.uid,
                         author_id=message.author,
                         message=message.text,
@@ -2902,7 +2857,7 @@ class Client(object):
         # New message
         elif delta.get("class") == "NewMessage":
             thread_id, thread_type = getThreadIdAndThreadType(metadata)
-            self.onMessage(
+            await self.onMessage(
                 mid=mid,
                 author_id=author_id,
                 message=delta.get("body", ""),
@@ -2922,9 +2877,9 @@ class Client(object):
 
         # Unknown message type
         else:
-            self.onUnknownMesssageType(msg=m)
+            await self.onUnknownMesssageType(msg=m)
 
-    def _parseMessage(self, content):
+    async def _parseMessage(self, content):
         """Get message and author name from content.
 
         May contain multiple messages in the content.
@@ -2937,7 +2892,7 @@ class Client(object):
 
         if "batches" in content:
             for batch in content["batches"]:
-                self._parseMessage(batch)
+                await self._parseMessage(batch)
 
         if "ms" not in content:
             return
@@ -2947,7 +2902,7 @@ class Client(object):
             try:
                 # Things that directly change chat
                 if mtype == "delta":
-                    self._parseDelta(m)
+                    await self._parseDelta(m)
                 # Inbox
                 elif mtype == "inbox":
                     self.onInbox(
@@ -2971,7 +2926,7 @@ class Client(object):
                         else:
                             thread_id = author_id
                     typing_status = TypingStatus(m.get("st"))
-                    self.onTyping(
+                    await self.onTyping(
                         author_id=author_id,
                         status=typing_status,
                         thread_id=thread_id,
@@ -2988,11 +2943,11 @@ class Client(object):
 
                 elif mtype in ["jewel_requests_add"]:
                     from_id = m["from"]
-                    self.onFriendRequest(from_id=from_id, msg=m)
+                    await self.onFriendRequest(from_id=from_id, msg=m)
 
                 # Happens on every login
                 elif mtype == "qprimer":
-                    self.onQprimer(ts=m.get("made"), msg=m)
+                    await self.onQprimer(ts=m.get("made"), msg=m)
 
                 # Is sent before any other message
                 elif mtype == "deltaflow":
@@ -3005,7 +2960,7 @@ class Client(object):
                         statuses[id_] = ActiveStatus._from_chatproxy_presence(id_, data)
                         self._buddylist[id_] = statuses[id_]
 
-                    self.onChatTimestamp(buddylist=statuses, msg=m)
+                    await self.onChatTimestamp(buddylist=statuses, msg=m)
 
                 # Buddylist overlay
                 elif mtype == "buddylist_overlay":
@@ -3020,14 +2975,14 @@ class Client(object):
                         )
                         self._buddylist[id_] = statuses[id_]
 
-                    self.onBuddylistOverlay(statuses=statuses, msg=m)
+                    await self.onBuddylistOverlay(statuses=statuses, msg=m)
 
                 # Unknown message type
                 else:
-                    self.onUnknownMesssageType(msg=m)
+                    await self.onUnknownMesssageType(msg=m)
 
             except Exception as e:
-                self.onMessageError(exception=e, msg=m)
+                await self.onMessageError(exception=e, msg=m)
 
     def startListening(self):
         """Start listening from an external event loop.
@@ -3037,7 +2992,7 @@ class Client(object):
         """
         self.listening = True
 
-    def doOneListen(self, markAlive=None):
+    async def doOneListen(self, markAlive=None):
         """Do one cycle of the listening loop.
 
         This method is useful if you want to control the client from an external event
@@ -3054,15 +3009,13 @@ class Client(object):
             self._markAlive = markAlive
         try:
             if self._markAlive:
-                self._ping()
-            content = self._pullMessage()
+                await self._ping()
+            content = await self._pullMessage()
             if content:
-                self._parseMessage(content)
-        except KeyboardInterrupt:
-            return False
-        except requests.Timeout:
+                await self._parseMessage(content)
+        except aiohttp.ServerTimeoutError:
             pass
-        except requests.ConnectionError:
+        except aiohttp.ClientConnectionError:
             # If the client has lost their internet connection, keep trying every 30 seconds
             time.sleep(30)
         except FBchatFacebookError as e:
@@ -3073,14 +3026,17 @@ class Client(object):
                 self.startListening()
             else:
                 raise e
+        except asyncio.CancelledError:
+            return False
         except Exception as e:
-            return self.onListenError(exception=e)
+            return await self.onListenError(exception=e)
 
         return True
 
     def stopListening(self):
         """Clean up the variables from `Client.startListening`."""
-        self.listening = False
+        if self.listening:
+            self.listening.cancel()
         self._sticky, self._pool = (None, None)
 
     def listen(self, markAlive=None):
@@ -3091,14 +3047,12 @@ class Client(object):
         """
         if markAlive is not None:
             self.setActiveStatus(markAlive)
+        self.listening = asyncio.ensure_future(self._listen)
 
-        self.startListening()
-        self.onListening()
-
-        while self.listening and self.doOneListen():
+    async def _listen(self):
+        await self.onListening()
+        while await self.doOneListen():
             pass
-
-        self.stopListening()
 
     def setActiveStatus(self, markAlive):
         """Change active status while listening.
@@ -3116,7 +3070,7 @@ class Client(object):
     EVENTS
     """
 
-    def onLoggingIn(self, email=None):
+    async def onLoggingIn(self, email=None):
         """Called when the client is logging in.
 
         Args:
@@ -3124,11 +3078,11 @@ class Client(object):
         """
         log.info("Logging in {}...".format(email))
 
-    def on2FACode(self):
+    async def on2FACode(self):
         """Called when a 2FA code is needed to progress."""
         return input("Please enter your 2FA code --> ")
 
-    def onLoggedIn(self, email=None):
+    async def onLoggedIn(self, email=None):
         """Called when the client is successfully logged in.
 
         Args:
@@ -3136,11 +3090,11 @@ class Client(object):
         """
         log.info("Login of {} successful.".format(email))
 
-    def onListening(self):
+    async def onListening(self):
         """Called when the client is listening."""
         log.info("Listening...")
 
-    def onListenError(self, exception=None):
+    async def onListenError(self, exception=None):
         """Called when an error was encountered while listening.
 
         Args:
@@ -3152,7 +3106,7 @@ class Client(object):
         log.exception("Got exception while listening")
         return True
 
-    def onMessage(
+    async def onMessage(
         self,
         mid=None,
         author_id=None,
@@ -3179,7 +3133,7 @@ class Client(object):
         """
         log.info("{} from {} in {}".format(message_object, thread_id, thread_type.name))
 
-    def onColorChange(
+    async def onColorChange(
         self,
         mid=None,
         author_id=None,
@@ -3208,7 +3162,7 @@ class Client(object):
             )
         )
 
-    def onEmojiChange(
+    async def onEmojiChange(
         self,
         mid=None,
         author_id=None,
@@ -3237,7 +3191,7 @@ class Client(object):
             )
         )
 
-    def onTitleChange(
+    async def onTitleChange(
         self,
         mid=None,
         author_id=None,
@@ -3266,7 +3220,7 @@ class Client(object):
             )
         )
 
-    def onImageChange(
+    async def onImageChange(
         self,
         mid=None,
         author_id=None,
@@ -3289,7 +3243,7 @@ class Client(object):
         """
         log.info("{} changed thread image in {}".format(author_id, thread_id))
 
-    def onNicknameChange(
+    async def onNicknameChange(
         self,
         mid=None,
         author_id=None,
@@ -3320,7 +3274,7 @@ class Client(object):
             )
         )
 
-    def onAdminAdded(
+    async def onAdminAdded(
         self,
         mid=None,
         added_id=None,
@@ -3342,7 +3296,7 @@ class Client(object):
         """
         log.info("{} added admin: {} in {}".format(author_id, added_id, thread_id))
 
-    def onAdminRemoved(
+    async def onAdminRemoved(
         self,
         mid=None,
         removed_id=None,
@@ -3364,7 +3318,7 @@ class Client(object):
         """
         log.info("{} removed admin: {} in {}".format(author_id, removed_id, thread_id))
 
-    def onApprovalModeChange(
+    async def onApprovalModeChange(
         self,
         mid=None,
         approval_mode=None,
@@ -3389,7 +3343,7 @@ class Client(object):
         else:
             log.info("{} disabled approval mode in {}".format(author_id, thread_id))
 
-    def onMessageSeen(
+    async def onMessageSeen(
         self,
         seen_by=None,
         thread_id=None,
@@ -3416,7 +3370,7 @@ class Client(object):
             )
         )
 
-    def onMessageDelivered(
+    async def onMessageDelivered(
         self,
         msg_ids=None,
         delivered_for=None,
@@ -3443,7 +3397,7 @@ class Client(object):
             )
         )
 
-    def onMarkedSeen(
+    async def onMarkedSeen(
         self, threads=None, seen_ts=None, ts=None, metadata=None, msg=None
     ):
         """Called when the client is listening, and the client has successfully marked threads as seen.
@@ -3462,7 +3416,7 @@ class Client(object):
             )
         )
 
-    def onMessageUnsent(
+    async def onMessageUnsent(
         self,
         mid=None,
         author_id=None,
@@ -3487,7 +3441,7 @@ class Client(object):
             )
         )
 
-    def onPeopleAdded(
+    async def onPeopleAdded(
         self,
         mid=None,
         added_ids=None,
@@ -3510,7 +3464,7 @@ class Client(object):
             "{} added: {} in {}".format(author_id, ", ".join(added_ids), thread_id)
         )
 
-    def onPersonRemoved(
+    async def onPersonRemoved(
         self,
         mid=None,
         removed_id=None,
@@ -3531,7 +3485,7 @@ class Client(object):
         """
         log.info("{} removed: {} in {}".format(author_id, removed_id, thread_id))
 
-    def onFriendRequest(self, from_id=None, msg=None):
+    async def onFriendRequest(self, from_id=None, msg=None):
         """Called when the client is listening, and somebody sends a friend request.
 
         Args:
@@ -3540,7 +3494,7 @@ class Client(object):
         """
         log.info("Friend request from {}".format(from_id))
 
-    def onInbox(self, unseen=None, unread=None, recent_unread=None, msg=None):
+    async def onInbox(self, unseen=None, unread=None, recent_unread=None, msg=None):
         """
         Todo:
             Documenting this
@@ -3553,7 +3507,7 @@ class Client(object):
         """
         log.info("Inbox event: {}, {}, {}".format(unseen, unread, recent_unread))
 
-    def onTyping(
+    async def onTyping(
         self, author_id=None, status=None, thread_id=None, thread_type=None, msg=None
     ):
         """Called when the client is listening, and somebody starts or stops typing into a chat.
@@ -3567,7 +3521,7 @@ class Client(object):
         """
         pass
 
-    def onGamePlayed(
+    async def onGamePlayed(
         self,
         mid=None,
         author_id=None,
@@ -3602,7 +3556,7 @@ class Client(object):
             )
         )
 
-    def onReactionAdded(
+    async def onReactionAdded(
         self,
         mid=None,
         reaction=None,
@@ -3630,7 +3584,7 @@ class Client(object):
             )
         )
 
-    def onReactionRemoved(
+    async def onReactionRemoved(
         self,
         mid=None,
         author_id=None,
@@ -3655,7 +3609,7 @@ class Client(object):
             )
         )
 
-    def onBlock(
+    async def onBlock(
         self, author_id=None, thread_id=None, thread_type=None, ts=None, msg=None
     ):
         """Called when the client is listening, and somebody blocks client.
@@ -3671,7 +3625,7 @@ class Client(object):
             "{} blocked {} ({}) thread".format(author_id, thread_id, thread_type.name)
         )
 
-    def onUnblock(
+    async def onUnblock(
         self, author_id=None, thread_id=None, thread_type=None, ts=None, msg=None
     ):
         """Called when the client is listening, and somebody blocks client.
@@ -3687,7 +3641,7 @@ class Client(object):
             "{} unblocked {} ({}) thread".format(author_id, thread_id, thread_type.name)
         )
 
-    def onLiveLocation(
+    async def onLiveLocation(
         self,
         mid=None,
         location=None,
@@ -3714,7 +3668,7 @@ class Client(object):
             )
         )
 
-    def onCallStarted(
+    async def onCallStarted(
         self,
         mid=None,
         caller_id=None,
@@ -3744,7 +3698,7 @@ class Client(object):
             "{} started call in {} ({})".format(caller_id, thread_id, thread_type.name)
         )
 
-    def onCallEnded(
+    async def onCallEnded(
         self,
         mid=None,
         caller_id=None,
@@ -3776,7 +3730,7 @@ class Client(object):
             "{} ended call in {} ({})".format(caller_id, thread_id, thread_type.name)
         )
 
-    def onUserJoinedCall(
+    async def onUserJoinedCall(
         self,
         mid=None,
         joined_id=None,
@@ -3803,7 +3757,7 @@ class Client(object):
             "{} joined call in {} ({})".format(joined_id, thread_id, thread_type.name)
         )
 
-    def onPollCreated(
+    async def onPollCreated(
         self,
         mid=None,
         poll=None,
@@ -3832,7 +3786,7 @@ class Client(object):
             )
         )
 
-    def onPollVoted(
+    async def onPollVoted(
         self,
         mid=None,
         poll=None,
@@ -3863,7 +3817,7 @@ class Client(object):
             )
         )
 
-    def onPlanCreated(
+    async def onPlanCreated(
         self,
         mid=None,
         plan=None,
@@ -3892,7 +3846,7 @@ class Client(object):
             )
         )
 
-    def onPlanEnded(
+    async def onPlanEnded(
         self,
         mid=None,
         plan=None,
@@ -3917,7 +3871,7 @@ class Client(object):
             "Plan {} has ended in {} ({})".format(plan, thread_id, thread_type.name)
         )
 
-    def onPlanEdited(
+    async def onPlanEdited(
         self,
         mid=None,
         plan=None,
@@ -3946,7 +3900,7 @@ class Client(object):
             )
         )
 
-    def onPlanDeleted(
+    async def onPlanDeleted(
         self,
         mid=None,
         plan=None,
@@ -3975,7 +3929,7 @@ class Client(object):
             )
         )
 
-    def onPlanParticipation(
+    async def onPlanParticipation(
         self,
         mid=None,
         plan=None,
@@ -4013,7 +3967,7 @@ class Client(object):
                 )
             )
 
-    def onQprimer(self, ts=None, msg=None):
+    async def onQprimer(self, ts=None, msg=None):
         """Called when the client just started listening.
 
         Args:
@@ -4022,7 +3976,7 @@ class Client(object):
         """
         pass
 
-    def onChatTimestamp(self, buddylist=None, msg=None):
+    async def onChatTimestamp(self, buddylist=None, msg=None):
         """Called when the client receives chat online presence update.
 
         Args:
@@ -4031,7 +3985,7 @@ class Client(object):
         """
         log.debug("Chat Timestamps received: {}".format(buddylist))
 
-    def onBuddylistOverlay(self, statuses=None, msg=None):
+    async def onBuddylistOverlay(self, statuses=None, msg=None):
         """Called when the client is listening and client receives information about friend active status.
 
         Args:
@@ -4040,7 +3994,7 @@ class Client(object):
         """
         log.debug("Buddylist overlay received: {}".format(statuses))
 
-    def onUnknownMesssageType(self, msg=None):
+    async def onUnknownMesssageType(self, msg=None):
         """Called when the client is listening, and some unknown data was received.
 
         Args:
@@ -4048,7 +4002,7 @@ class Client(object):
         """
         log.debug("Unknown message received: {}".format(msg))
 
-    def onMessageError(self, exception=None, msg=None):
+    async def onMessageError(self, exception=None, msg=None):
         """Called when an error was encountered while parsing received data.
 
         Args:
