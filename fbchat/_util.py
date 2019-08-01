@@ -40,14 +40,6 @@ def strip_json_cruft(text):
         raise FBchatException("No JSON object found: {!r}".format(text))
 
 
-def get_decoded_r(r):
-    return get_decoded(r._content)
-
-
-def get_decoded(content):
-    return content.decode("utf-8")
-
-
 def parse_json(content):
     try:
         return json.loads(content)
@@ -127,9 +119,9 @@ def handle_graphql_errors(j):
         )
 
 
-def check_request(r):
-    check_http_code(r.status_code)
-    content = get_decoded_r(r)
+async def check_request(r):
+    check_http_code(r.status)
+    content = await r.text()
     check_content(content)
     return content
 
@@ -154,7 +146,7 @@ def check_content(content, as_json=True):
 def to_json(content, log):
     content = strip_json_cruft(content)
     j = parse_json(content)
-    log.debug(j)
+    # log.debug(j)
     return j
 
 

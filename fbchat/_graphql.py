@@ -37,7 +37,7 @@ def queries_to_json(*queries):
     return json.dumps(rtn)
 
 
-def response_to_json(content):
+def response_to_json(content, log):
     content = _util.strip_json_cruft(content)  # Usually only needed in some error cases
     try:
         j = json.loads(content, cls=ConcatJSONDecoder)
@@ -57,7 +57,7 @@ def response_to_json(content):
         else:
             rtn[int(key[1:])] = value["data"]
 
-    _util.log.debug(rtn)
+    # log.debug(rtn)
 
     return rtn
 

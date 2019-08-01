@@ -58,6 +58,7 @@ class Client(object):
         """
         self._sticky, self._pool = (None, None)
         self._seq = "0"
+        self._state = None
         self._client_id = hex(int(random() * 2 ** 31))[2:]
         self._default_thread_id = None
         self._default_thread_type = None
@@ -98,7 +99,7 @@ class Client(object):
         if not query:
             query = {}
         query.update(self._state.get_params())
-        return query
+        return {key: value for key, value in query.items() if value is not None}
 
     async def _do_refresh(self):
         # TODO: Raise the error instead, and make the user do the refresh manually
@@ -110,7 +111,7 @@ class Client(object):
         payload = self._generatePayload(query)
         self._req_log.debug(f"GET {url}?{URL().with_query(payload).query_string}")
         r = await self._state._session.get(prefix_url(url), params=payload)
-        content = check_request(r)
+        content = await check_request(r)
         j = to_json(content, log=self._util_log)
         try:
             handle_payload_error(j)
@@ -122,13 +123,21 @@ class Client(object):
         return j
 
     async def _post(self, url, query=None, files=None, as_graphql=False, error_retries=3):
-        payload = self._generatePayload(query)
-        self._req_log.debug(f"POST {url}?{URL().with_query(payload).query_string}")
-        r = await self._state._session.post(prefix_url(url), data=payload, files=files)
-        content = check_request(r)
+        if files:
+            payload = aiohttp.FormData()
+            for key, value in self._generatePayload(query).items():
+                payload.add_field(key, str(value))
+            for key, (name, file, content_type) in files.items():
+                payload.add_field(key, file, filename=name, content_type=content_type)
+            self._req_log.debug(f"POST {url} (files)")
+        else:
+            payload = self._generatePayload(query)
+            self._req_log.debug(f"POST {url}?{URL().with_query(payload).query_string}")
+        r = await self._state._session.post(prefix_url(url), data=payload)
+        content = await check_request(r)
         try:
             if as_graphql:
-                return _graphql.response_to_json(content)
+                return _graphql.response_to_json(content, log=self._util_log)
             else:
                 j = to_json(content, log=self._util_log)
                 # TODO: Remove this, and move it to _payload_post instead
@@ -2874,6 +2883,7 @@ class Client(object):
                     tags=metadata.get("tags"),
                     author=author_id,
                     timestamp=ts,
+                    log=self._util_log,
                 ),
                 thread_id=thread_id,
                 thread_type=thread_type,
@@ -3054,7 +3064,7 @@ class Client(object):
         """
         if markAlive is not None:
             self.setActiveStatus(markAlive)
-        self.listening = asyncio.ensure_future(self._listen)
+        self.listening = asyncio.ensure_future(self._listen())
 
     async def _listen(self):
         await self.onListening()

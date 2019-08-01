@@ -95,7 +95,7 @@ class State(object):
         rtn = self.get_cookies().get("c_user")
         if rtn is None:
             return None
-        return str(rtn)
+        return rtn.value
 
     def get_params(self):
         self._counter += 1  # TODO: Make this operation atomic / thread-safe
@@ -137,7 +137,7 @@ class State(object):
             resp = await session.get("https://m.facebook.com/login/save-device/cancel/")
 
         if is_home(resp.url):
-            return cls.from_session(session=session)
+            return await cls.from_session(session=session)
         else:
             raise _exception.FBchatUserError(
                 "Login failed. Check email/password. "
