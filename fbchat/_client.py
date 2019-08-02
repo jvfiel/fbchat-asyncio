@@ -59,6 +59,7 @@ class Client(object):
         self._sticky, self._pool = (None, None)
         self._seq = "0"
         self._state = None
+        self._uid = None
         self._client_id = hex(int(random() * 2 ** 31))[2:]
         self._default_thread_id = None
         self._default_thread_type = None
@@ -212,6 +213,8 @@ class Client(object):
         Returns:
             dict: A dictionary containing session cookies
         """
+        if not self._state:
+            return None
         return self._state.get_cookies()
 
     async def setSession(self, session_cookies, user_agent=None):
