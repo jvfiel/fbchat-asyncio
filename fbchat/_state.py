@@ -24,8 +24,8 @@ def is_home(url):
     return "home" in path or "/" == path
 
 
-async def _2fa_helper(session, code, r, log):
-    soup = find_input_fields(r.text)
+async def _2fa_helper(session, code, resp, log):
+    soup = find_input_fields(await resp.text())
     data = dict()
 
     url = "https://m.facebook.com/login/checkpoint/"
@@ -37,10 +37,10 @@ async def _2fa_helper(session, code, r, log):
     data["codes_submitted"] = 0
     log.info("Submitting 2FA code.")
 
-    r = await session.post(url, data=data)
+    resp = await session.post(url, data=data)
 
-    if is_home(r.url):
-        return r
+    if is_home(resp.url):
+        return resp
 
     del data["approvals_code"]
     del data["submit[Submit Code]"]
@@ -50,35 +50,35 @@ async def _2fa_helper(session, code, r, log):
     data["submit[Continue]"] = "Continue"
     log.info("Saving browser.")
     # At this stage, we have dtsg, nh, name_action_selected, submit[Continue]
-    r = await session.post(url, data=data)
+    resp = await session.post(url, data=data)
 
-    if is_home(r.url):
-        return r
+    if is_home(resp.url):
+        return resp
 
     del data["name_action_selected"]
     log.info("Starting Facebook checkup flow.")
     # At this stage, we have dtsg, nh, submit[Continue]
-    r = await session.post(url, data=data)
+    resp = await session.post(url, data=data)
 
-    if is_home(r.url):
-        return r
+    if is_home(resp.url):
+        return resp
 
     del data["submit[Continue]"]
     data["submit[This was me]"] = "This Was Me"
     log.info("Verifying login attempt.")
     # At this stage, we have dtsg, nh, submit[This was me]
-    r = await session.post(url, data=data)
+    resp = await session.post(url, data=data)
 
-    if is_home(r.url):
-        return r
+    if is_home(resp.url):
+        return resp
 
     del data["submit[This was me]"]
     data["submit[Continue]"] = "Continue"
     data["name_action_selected"] = "save_device"
     log.info("Saving device again.")
     # At this stage, we have dtsg, nh, submit[Continue], name_action_selected
-    r = await session.post(url, data=data)
-    return r
+    resp = await session.post(url, data=data)
+    return resp
 
 
 @attr.s(slots=True)  # TODO i Python 3: Add kw_only=True
