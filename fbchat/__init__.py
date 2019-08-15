@@ -12,7 +12,7 @@ from .models import *
 from ._client import Client
 
 __title__ = "fbchat-asyncio"
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 __description__ = "Facebook Messenger library for Python/Asyncio."
 
 __copyright__ = "Copyright 2015 - 2019 by Taehoon Kim"
