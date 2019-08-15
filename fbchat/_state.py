@@ -174,7 +174,11 @@ class State(object):
             fb_dtsg = fb_dtsg_element["value"]
         else:
             # Fall back to searching with a regex
-            fb_dtsg = FB_DTSG_REGEX.search(text).group(1)
+            match = FB_DTSG_REGEX.search(text)
+            if not match:
+                raise _exception.FBchatUserError("Restoring session failed "
+                                                 f"(response path: {resp.url.path})")
+            fb_dtsg = match.group(1)
 
         revision = int(text.split('"client_revision":', 1)[1].split(",", 1)[0])
 

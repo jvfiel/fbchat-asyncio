@@ -205,6 +205,8 @@ class Client(object):
         Returns:
             bool: True if the client is still logged in
         """
+        if not self._state:
+            return False
         return await self._state.is_logged_in()
 
     def getSession(self):
