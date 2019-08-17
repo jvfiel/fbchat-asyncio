@@ -215,5 +215,5 @@ def get_url_parameter(url, param):
 
 def prefix_url(url):
     if url.startswith("/"):
-        return "https://www.facebook.com" + url
+        return "https://www.messenger.com" + url
     return url

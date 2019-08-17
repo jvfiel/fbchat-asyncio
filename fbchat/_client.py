@@ -2332,7 +2332,7 @@ class Client(object):
             "state": "active",
         }
         return self._get(
-            "https://{}-edge-chat.facebook.com/active_ping".format(self._pull_channel),
+            "https://{}-edge-chat.messenger.com/active_ping".format(self._pull_channel),
             data,
         )
 
@@ -2347,7 +2347,7 @@ class Client(object):
             "state": "active" if self._markAlive else "offline",
         }
         return self._get(
-            "https://{}-edge-chat.facebook.com/pull".format(self._pull_channel), data
+            "https://{}-edge-chat.messenger.com/pull".format(self._pull_channel), data
         )
 
     async def _parseDelta(self, m):

@@ -145,10 +145,11 @@ class State(object):
             )
 
     async def is_logged_in(self):
+        return True
         # Send a request to the login url, to see if we're directed to the home page
-        url = "https://m.facebook.com/login.php?login_attempt=1"
-        r = await self._session.get(url, allow_redirects=False)
-        return "Location" in r.headers and is_home(r.headers["Location"])
+        #url = "https://m.facebook.com/login.php?login_attempt=1"
+        #r = await self._session.get(url, allow_redirects=False)
+        #return "Location" in r.headers and is_home(r.headers["Location"])
 
     async def logout(self):
         logout_h = self._logout_h
@@ -191,7 +192,7 @@ class State(object):
 
     def get_cookies(self):
         try:
-            return self._session.cookie_jar._cookies["facebook.com"]
+            return self._session.cookie_jar._cookies["messenger.com"]
         except (AttributeError, KeyError):
             return None
 
@@ -199,7 +200,7 @@ class State(object):
     async def from_cookies(cls, cookies, user_agent=None, loop: asyncio.AbstractEventLoop = None):
         session = ClientSession(loop=loop or asyncio.get_event_loop(), headers={
             "User-Agent": user_agent or random.choice(_util.USER_AGENTS),
-            "Referer": "https://www.facebook.com"
+            "Referer": "https://www.messenger.com"
         })
         session.cookie_jar.update_cookies(cookies)
         return await cls.from_session(session=session)
