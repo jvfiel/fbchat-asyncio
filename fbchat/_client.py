@@ -554,7 +554,9 @@ class Client:
                     "{} had an unknown thread type: {}".format(_id, k)
                 )
 
-        self._log.debug("Fetch info: %s", entries)
+        # self._log.debug("Fetch info: %s", entries)
+        print(">>> entries:")
+        print(entries)
         return entries
 
     async def fetch_user_info(self, *user_ids):
@@ -573,6 +575,7 @@ class Client:
             FBchatException: If request failed
         """
         threads = await self.fetch_thread_info(*user_ids)
+        print("fetch thread info...")
         users = {}
         for id_, thread in threads.items():
             if thread.type == ThreadType.USER:
@@ -1143,6 +1146,12 @@ class Client:
         )
 
     async def _upload(self, files, voice_clip=False):
+        print("uploading files....")
+        # print(str(files[0])[1:10])
+        # print(files)
+        # upload_file = await self._state._upload(files, voice_clip=voice_clip)
+        # print(upload_file)
+        # return upload_file
         return await self._state._upload(files, voice_clip=voice_clip)
 
     async def _send_files(
@@ -1180,8 +1189,15 @@ class Client:
         Raises:
             FBchatException: If request failed
         """
+        print("####################################")
+        print("send remote files....")
         file_urls = _util.require_list(file_urls)
-        files = await self._upload(_util.get_files_from_urls(file_urls))
+        urls_ = await _util.get_files_from_urls(file_urls)
+        # print(urls_)
+        print("done get files from urls")
+        files = await self._upload(urls_)
+        # print(files)
+        print("done upload...")
         return await self._send_files(
             files=files, message=message, thread_id=thread_id, thread_type=thread_type
         )
@@ -2755,10 +2771,7 @@ class Client:
             "includeDeliveryReceipts": False,
             "includeSeqID": True,
         }))
-        try:
-            self._last_seq_id = int(j["viewer"]["message_threads"]["sync_sequence_id"])
-        except (KeyError, ValueError):
-            self._last_seq_id = 0
+        sync_sequence_id = j["viewer"]["message_threads"]["sync_sequence_id"]
 
         # Random session ID
         sid = random.randint(1, 9007199254740991)
@@ -2796,35 +2809,35 @@ class Client:
         # Fork of hbmqtt with the MQTT version number (4 -> 3) and protocol name (MQTT -> MQIsdp) changed.
         client = MQTTClient(client_id="mqttwsclient", config={
             "auto_reconnect": True,
-            "reconnect_max_interval": 64,
-            "reconnect_retries": 5,
             # Upstream hbmqtt has no way to set the username (other than the URL, but that doesn't
             # work because the username is JSON and contains :'s and hbmqtt doesn't url-decode it),
             # so this option only works in my fork.
             "username": json.dumps(username)
         })
-        client.post_connect = self._subscribe_mqtt
 
         cont = True
         while cont:
-            cont = await self._do_listen_mqtt(client, sid, headers)
+            cont = await self._do_listen_mqtt(client, sid, sync_sequence_id, username, headers)
 
-    async def _subscribe_mqtt(self, client) -> None:
-        self._log.debug("Subscribing to MQTT channels")
+    async def _do_listen_mqtt(self, client, sid, sync_sequence_id, username, headers) -> bool:
+        try:
+            await client.connect(uri=f"wss://edge-chat.facebook.com/chat?region=atn&sid={sid}",
+                                 extra_headers=headers)
+        except Exception as e:
+            return await self.on_mqtt_fatal_error(e)
         await client.subscribe([
             ("/legacy_web", QOS_0),
             ("/webrtc", QOS_0),
             ("/br_sr", QOS_0),
             ("/sr_res", QOS_0),
-            ("/t_ms", QOS_0),  # Messages
-            ("/thread_typing", QOS_0),  # Group typing notifications
-            ("/orca_typing_notifications", QOS_0),  # Private chat typing notifications
+            ("/t_ms", QOS_0), # Messages
+            ("/thread_typing", QOS_0), # Group typing notifications
+            ("/orca_typing_notifications", QOS_0), # Private chat typing notifications
             ("/notify_disconnect", QOS_0),
             ("/orca_presence", QOS_0),
         ])
         # I read somewhere that not doing this might add message send limits
         await client.unsubscribe(["/orca_message_notifications"])
-        self._log.debug("Sending messenger sync create queue request")
         # This is required to actually receive messages. The parameters probably do something.
         await client.publish("/messenger_sync_create_queue", json.dumps({
             "sync_api_version": 10,
@@ -2832,16 +2845,9 @@ class Client:
             "delta_batch_size": 500,
             "encoding": "JSON",
             "entity_fbid": self._uid,
-            "initial_titan_sequence_id": str(self._last_seq_id),
+            "initial_titan_sequence_id": str(sync_sequence_id),
             "device_params": None
         }).encode("utf-8"))
-
-    async def _do_listen_mqtt(self, client, sid, headers) -> bool:
-        try:
-            await client.connect(uri=f"wss://edge-chat.facebook.com/chat?region=atn&sid={sid}",
-                                 extra_headers=headers)
-        except Exception as e:
-            return await self.on_mqtt_fatal_error(e)
 
         await self.on_listening_mqtt()
         try:
@@ -2878,8 +2884,6 @@ class Client:
     async def _parse_mqtt(self, event_type: str, event: dict) -> None:
         if event_type == "/t_ms":
             for delta in event.get("deltas", []):
-                self._last_seq_id = max(self._last_seq_id,
-                                        delta.get("lastIssuedSeqId") or delta.get("irisSeqId") or 0)
                 await self._parse_delta({"delta": delta})
         elif event_type in ("/thread_typing", "/orca_typing_notifications"):
             author_id = str(event.get("sender_fbid"))
